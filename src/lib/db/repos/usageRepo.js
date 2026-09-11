@@ -539,6 +539,39 @@ export async function getUsageHistory(filter = {}) {
   }));
 }
 
+/**
+ * Lightweight per-connection request counts for the current local calendar day.
+ *
+ * Reads the already-aggregated `usageDaily.byAccount` rollup (keyed by
+ * connectionId) instead of scanning usageHistory, so it is cheap enough for the
+ * credential-selection hot path. This is a read-only balancing signal, never an
+ * eligibility filter: missing rows/accounts resolve to 0 and any failure is
+ * swallowed to an empty map so callers fall back to their existing ordering.
+ *
+ * @param {Iterable<string>} connectionIds
+ * @param {Date} [now]
+ * @returns {Promise<Map<string, number>>}
+ */
+export async function getTodayConnectionRequestCounts(connectionIds, now = new Date()) {
+  const ids = [...new Set((connectionIds || []).filter((id) => isString(id) && id))];
+  const counts = new Map(ids.map((id) => [id, 0]));
+  if (ids.length === 0) return counts;
+  try {
+    const db = await getAdapter();
+    const row = db.get(`SELECT data FROM usageDaily WHERE dateKey = ?`, [toLocalDateKey(now)]);
+    const byAccount = parseJson(row?.data, {}).byAccount;
+    if (!isObject(byAccount)) return counts;
+    for (const id of ids) {
+      const entry = byAccount[id];
+      const requests = isObject(entry) ? Number(entry.requests) : 0;
+      counts.set(id, Number.isFinite(requests) && requests > 0 ? requests : 0);
+    }
+  } catch {
+    // Balancing is best-effort; selection falls back to lastUsedAt/priority.
+  }
+  return counts;
+}
+
 function loadDaysInRange(adapter, maxDays, identitySalt, now = new Date()) {
   const todayKey = toLocalDateKey(now);
   const params = [];

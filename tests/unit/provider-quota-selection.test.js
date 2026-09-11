@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   getProxyPools: vi.fn(),
   getQuotaFetchState: vi.fn(),
   getQuotaReservationPressure: vi.fn(),
+  getTodayConnectionRequestCounts: vi.fn(),
   validateApiKey: vi.fn(),
 }));
 
@@ -21,6 +22,7 @@ vi.mock("@/lib/localDb", () => ({
   validateApiKey: mocks.validateApiKey,
   getQuotaFetchState: mocks.getQuotaFetchState,
   getQuotaReservationPressure: mocks.getQuotaReservationPressure,
+  getTodayConnectionRequestCounts: mocks.getTodayConnectionRequestCounts,
 }));
 
 const { getProviderCredentials } = await import("../../src/sse/services/auth.js");
@@ -102,6 +104,7 @@ describe("quota-aware provider selection", () => {
     mocks.getProxyPools.mockResolvedValue([]);
     mocks.getQuotaFetchState.mockResolvedValue(null);
     mocks.getQuotaReservationPressure.mockResolvedValue(new Map());
+    mocks.getTodayConnectionRequestCounts.mockResolvedValue(new Map());
     mocks.updateProviderConnection.mockImplementation(async (id, patch) => ({
       ...connection(id, id === "one" ? 1 : 2),
       ...patch,
@@ -243,30 +246,32 @@ describe("quota-aware provider selection", () => {
     ]);
     mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin", stickyRoundRobinLimit: 3 });
 
+    // Round-robin ignores the quota rank for the first pick: "two" has never
+    // been used, so LRU wins over the higher-quota "one".
     const first = await getProviderCredentials("codex", null, "gpt-5.4", {
       now: NOW,
       resourceKeys: ["model:gpt-5.4"],
       quotaSnapshotsLoader: async () => [providerRow("one", 90), providerRow("two", 10)],
       sessionId: "sess-sticky-quota",
     });
-    expect(first.connectionId).toBe("one");
+    expect(first.connectionId).toBe("two");
 
-    // Second call reverses the quota preference; without session affinity the
-    // router would pick account two. The session must stay on one.
+    // Second call reverses the quota preference and "one" is now the LRU
+    // candidate; the session must stay on "two" via affinity.
     const second = await getProviderCredentials("codex", null, "gpt-5.4", {
       now: NOW,
       resourceKeys: ["model:gpt-5.4"],
       quotaSnapshotsLoader: async () => [providerRow("one", 10), providerRow("two", 90)],
       sessionId: "sess-sticky-quota",
     });
-    expect(second.connectionId).toBe("one");
+    expect(second.connectionId).toBe("two");
   });
 
   it("advances round-robin by lastUsedAt instead of pinning the quota-ranked top account", async () => {
-    // Regression: codebuddy-cn-style saturated pools make every account
-    // comparable at ratio 1.0, so quota ranking collapses to priority order.
-    // Under round-robin a NEW session (no affinity) must advance via
-    // lastUsedAt (LRU), NOT latch onto availableConnections[0].
+    // Regression: a saturated quota pool makes every account comparable at
+    // ratio 1.0, so quota ranking collapses to priority order. Under
+    // round-robin a NEW session (no affinity) must advance via lastUsedAt
+    // (LRU), NOT latch onto availableConnections[0].
     mocks.getProviderConnections.mockResolvedValue([
       { ...connection("one", 1), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
       { ...connection("two", 2), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
@@ -282,6 +287,72 @@ describe("quota-aware provider selection", () => {
     });
 
     expect(selected.connectionId).toBe("one");
+  });
+
+  it("codebuddy-cn balances round-robin by today's request count", async () => {
+    // "two" is the most recently used account, but "one" has served far fewer
+    // requests today, so the new session must land on "one".
+    mocks.getProviderConnections.mockResolvedValue([
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin", stickyRoundRobinLimit: 1 });
+    mocks.getTodayConnectionRequestCounts.mockResolvedValue(new Map([["one", 2], ["two", 10]]));
+
+    const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+      now: NOW,
+      sessionId: "sess-cbcn-balance",
+    });
+
+    expect(selected.connectionId).toBe("one");
+    expect(mocks.getTodayConnectionRequestCounts).toHaveBeenCalledWith(["one", "two"], expect.any(Date));
+  });
+
+  it("codebuddy-cn falls back to lastUsedAt when today's counts tie", async () => {
+    mocks.getProviderConnections.mockResolvedValue([
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin", stickyRoundRobinLimit: 1 });
+    mocks.getTodayConnectionRequestCounts.mockResolvedValue(new Map([["one", 5], ["two", 5]]));
+
+    const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+      now: NOW,
+      sessionId: "sess-cbcn-tie",
+    });
+
+    expect(selected.connectionId).toBe("two");
+  });
+
+  it("codebuddy-cn falls back to lastUsedAt when the count read fails", async () => {
+    mocks.getProviderConnections.mockResolvedValue([
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin", stickyRoundRobinLimit: 1 });
+    mocks.getTodayConnectionRequestCounts.mockRejectedValue(new Error("db unavailable"));
+
+    const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+      now: NOW,
+      sessionId: "sess-cbcn-failopen",
+    });
+
+    expect(selected.connectionId).toBe("one");
+  });
+
+  it("does not read request counts for non-codebuddy providers", async () => {
+    mocks.getProviderConnections.mockResolvedValue([
+      { ...connection("one", 1), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
+      connection("two", 2),
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin", stickyRoundRobinLimit: 1 });
+
+    await getProviderCredentials("codex", null, "gpt-5.4", {
+      now: NOW,
+      sessionId: "sess-codex",
+    });
+
+    expect(mocks.getTodayConnectionRequestCounts).not.toHaveBeenCalled();
   });
 
   it("projects the committed round-robin revision instead of the stale selected row", async () => {
