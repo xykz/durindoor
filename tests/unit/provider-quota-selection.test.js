@@ -262,6 +262,28 @@ describe("quota-aware provider selection", () => {
     expect(second.connectionId).toBe("one");
   });
 
+  it("advances round-robin by lastUsedAt instead of pinning the quota-ranked top account", async () => {
+    // Regression: codebuddy-cn-style saturated pools make every account
+    // comparable at ratio 1.0, so quota ranking collapses to priority order.
+    // Under round-robin a NEW session (no affinity) must advance via
+    // lastUsedAt (LRU), NOT latch onto availableConnections[0].
+    mocks.getProviderConnections.mockResolvedValue([
+      { ...connection("one", 1), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
+      { ...connection("two", 2), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin", stickyRoundRobinLimit: 1 });
+
+    // Quota order prefers "two"; lastUsedAt order prefers "one".
+    const selected = await getProviderCredentials("codex", null, "gpt-5.4", {
+      now: NOW,
+      resourceKeys: ["model:gpt-5.4"],
+      quotaSnapshotsLoader: async () => [providerRow("one", 10), providerRow("two", 90)],
+      sessionId: "sess-new-no-affinity",
+    });
+
+    expect(selected.connectionId).toBe("one");
+  });
+
   it("projects the committed round-robin revision instead of the stale selected row", async () => {
     mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin", stickyRoundRobinLimit: 3 });
     mocks.getProviderConnections.mockResolvedValue([

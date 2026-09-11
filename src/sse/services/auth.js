@@ -650,6 +650,14 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     }
 
     let connection;
+    // Selection precedence:
+    //   1. explicit preferredConnectionId pin
+    //   2. round-robin session affinity (a session keeps its account)
+    //   3. quota-ranked top candidate, but only for NON round-robin strategies
+    //   4. round-robin advance by lastUsedAt (LRU), or fill-first priority order
+    // Round-robin deliberately ignores the quota rank for the final pick: quota
+    // only reorders the pool/eligibility above, so a saturated ranking (every
+    // account comparable at ratio 1.0) cannot pin one account for every session.
     // For round-robin, honor existing session affinity before quota ranking so
     // a session that already picked an account stays on it when it remains eligible.
     const stickyConnectionId = sessionId && strategy === "round-robin" ?
@@ -674,9 +682,13 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       connection = (await updateProviderConnection(connection.id, {
         lastUsedAt: new Date().toISOString()
       })) || connection;
-    } else if (quotaRanked) {
+    } else if (quotaRanked && strategy !== "round-robin") {
       // Persistent pressure + last-selection history provide the fairness tier
       // for quota-comparable accounts. Atomic acquire remains the final arbiter.
+      // Under round-robin, quota score only reorders the candidate pool (above);
+      // selection still advances through session affinity / lastUsedAt so a
+      // saturated pool (e.g. every account at ratio 1.0) cannot pin the
+      // highest-priority account for every new session.
       connection = availableConnections[0];
     } else if (strategy === "round-robin") {
       const stickyLimit = providerOverride.stickyRoundRobinLimit || selectionSettings.stickyRoundRobinLimit || 3;
