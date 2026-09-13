@@ -9,7 +9,7 @@ const mocks = vi.hoisted(() => ({
   getProxyPools: vi.fn(),
   getQuotaFetchState: vi.fn(),
   getQuotaReservationPressure: vi.fn(),
-  getTodayConnectionRequestCounts: vi.fn(),
+  getTodayConnectionTokenTotals: vi.fn(),
   validateApiKey: vi.fn(),
 }));
 
@@ -22,7 +22,7 @@ vi.mock("@/lib/localDb", () => ({
   validateApiKey: mocks.validateApiKey,
   getQuotaFetchState: mocks.getQuotaFetchState,
   getQuotaReservationPressure: mocks.getQuotaReservationPressure,
-  getTodayConnectionRequestCounts: mocks.getTodayConnectionRequestCounts,
+  getTodayConnectionTokenTotals: mocks.getTodayConnectionTokenTotals,
 }));
 
 const { getProviderCredentials } = await import("../../src/sse/services/auth.js");
@@ -104,7 +104,7 @@ describe("quota-aware provider selection", () => {
     mocks.getProxyPools.mockResolvedValue([]);
     mocks.getQuotaFetchState.mockResolvedValue(null);
     mocks.getQuotaReservationPressure.mockResolvedValue(new Map());
-    mocks.getTodayConnectionRequestCounts.mockResolvedValue(new Map());
+    mocks.getTodayConnectionTokenTotals.mockResolvedValue(new Map());
     mocks.updateProviderConnection.mockImplementation(async (id, patch) => ({
       ...connection(id, id === "one" ? 1 : 2),
       ...patch,
@@ -289,15 +289,15 @@ describe("quota-aware provider selection", () => {
     expect(selected.connectionId).toBe("one");
   });
 
-  it("codebuddy-cn balances round-robin by today's request count", async () => {
-    // "two" is the most recently used account, but "one" has served far fewer
-    // requests today, so the new session must land on "one".
+  it("codebuddy-cn balances round-robin by today's token total", async () => {
+    // "two" is the most recently used account, but "one" has burned far fewer
+    // tokens today, so the new session must land on "one".
     mocks.getProviderConnections.mockResolvedValue([
       { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
       { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
     ]);
     mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin", stickyRoundRobinLimit: 1 });
-    mocks.getTodayConnectionRequestCounts.mockResolvedValue(new Map([["one", 2], ["two", 10]]));
+    mocks.getTodayConnectionTokenTotals.mockResolvedValue(new Map([["one", 2_000], ["two", 10_000]]));
 
     const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
       now: NOW,
@@ -305,16 +305,16 @@ describe("quota-aware provider selection", () => {
     });
 
     expect(selected.connectionId).toBe("one");
-    expect(mocks.getTodayConnectionRequestCounts).toHaveBeenCalledWith(["one", "two"], expect.any(Date));
+    expect(mocks.getTodayConnectionTokenTotals).toHaveBeenCalledWith(["one", "two"], expect.any(Date));
   });
 
-  it("codebuddy-cn falls back to lastUsedAt when today's counts tie", async () => {
+  it("codebuddy-cn falls back to lastUsedAt when today's token totals tie", async () => {
     mocks.getProviderConnections.mockResolvedValue([
       { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
       { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
     ]);
     mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin", stickyRoundRobinLimit: 1 });
-    mocks.getTodayConnectionRequestCounts.mockResolvedValue(new Map([["one", 5], ["two", 5]]));
+    mocks.getTodayConnectionTokenTotals.mockResolvedValue(new Map([["one", 5_000], ["two", 5_000]]));
 
     const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
       now: NOW,
@@ -324,13 +324,13 @@ describe("quota-aware provider selection", () => {
     expect(selected.connectionId).toBe("two");
   });
 
-  it("codebuddy-cn falls back to lastUsedAt when the count read fails", async () => {
+  it("codebuddy-cn falls back to lastUsedAt when the token read fails", async () => {
     mocks.getProviderConnections.mockResolvedValue([
       { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
       { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
     ]);
     mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin", stickyRoundRobinLimit: 1 });
-    mocks.getTodayConnectionRequestCounts.mockRejectedValue(new Error("db unavailable"));
+    mocks.getTodayConnectionTokenTotals.mockRejectedValue(new Error("db unavailable"));
 
     const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
       now: NOW,
@@ -340,7 +340,7 @@ describe("quota-aware provider selection", () => {
     expect(selected.connectionId).toBe("one");
   });
 
-  it("does not read request counts for non-codebuddy providers", async () => {
+  it("does not read token totals for non-codebuddy providers", async () => {
     mocks.getProviderConnections.mockResolvedValue([
       { ...connection("one", 1), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
       connection("two", 2),
@@ -352,7 +352,7 @@ describe("quota-aware provider selection", () => {
       sessionId: "sess-codex",
     });
 
-    expect(mocks.getTodayConnectionRequestCounts).not.toHaveBeenCalled();
+    expect(mocks.getTodayConnectionTokenTotals).not.toHaveBeenCalled();
   });
 
   it("projects the committed round-robin revision instead of the stale selected row", async () => {

@@ -2,7 +2,7 @@ import { isFreeNoAuthProviderDisabled } from "@/sse/services/freeProviderGate.js
 import {
   getProviderConnections, getProviderConnectionById, getApiKeyByKey, validateApiKey,
   updateProviderConnection, getSettings, getProxyPools,
-  getQuotaReservationPressure, getTodayConnectionRequestCounts } from
+  getQuotaReservationPressure, getTodayConnectionTokenTotals } from
 "@/lib/localDb";
 import { MEMORY_CONFIG } from "open-sse/config/runtimeConfig.js";
 import { isApiKeyExpired } from "@/shared/utils/apiKeyExpiry";
@@ -651,11 +651,11 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
 
     let connection;
     // codebuddy-cn only: balance round-robin first-pick by today's per-account
-    // request count so a long-idle account is not latched by every new session.
+    // token total so a long-idle account is not latched by every new session.
     // Read-only signal; a null/empty map (other providers, day rollover, read
     // failure) leaves the existing lastUsedAt/priority ordering untouched.
-    const requestCounts = providerId === "codebuddy-cn" && strategy === "round-robin" ?
-    await getTodayConnectionRequestCounts(
+    const usageTotals = providerId === "codebuddy-cn" && strategy === "round-robin" ?
+    await getTodayConnectionTokenTotals(
       availableConnections.map((candidate) => candidate.id),
       new Date(selectionNow)
     ).catch(() => null) :
@@ -665,7 +665,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     //   2. round-robin session affinity (a session keeps its account)
     //   3. quota-ranked top candidate, but only for NON round-robin strategies
     //   4. round-robin advance by lastUsedAt (LRU), or fill-first priority order
-    //      (codebuddy-cn refines step 4 with today's request count)
+    //      (codebuddy-cn refines step 4 with today's token total)
     // Round-robin deliberately ignores the quota rank for the final pick: quota
     // only reorders the pool/eligibility above, so a saturated ranking (every
     // account comparable at ratio 1.0) cannot pin one account for every session.
@@ -705,13 +705,13 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       const stickyLimit = providerOverride.stickyRoundRobinLimit || selectionSettings.stickyRoundRobinLimit || 3;
 
       const pickOldest = () => {
-        const countOf = (candidate) => requestCounts?.get(candidate.id);
+        const totalOf = (candidate) => usageTotals?.get(candidate.id);
         const sortedByOldest = [...availableConnections].sort((a, b) => {
-          // codebuddy-cn: fewer requests today wins before recency. Equal counts
+          // codebuddy-cn: fewer tokens today wins before recency. Equal totals
           // (or a missing signal) fall through to the original ordering.
-          const countA = countOf(a);
-          const countB = countOf(b);
-          if (countA !== undefined && countB !== undefined && countA !== countB) return countA - countB;
+          const totalA = totalOf(a);
+          const totalB = totalOf(b);
+          if (totalA !== undefined && totalB !== undefined && totalA !== totalB) return totalA - totalB;
           if (!a.lastUsedAt && !b.lastUsedAt) return (a.priority || 999) - (b.priority || 999);
           if (!a.lastUsedAt) return -1;
           if (!b.lastUsedAt) return 1;

@@ -259,7 +259,7 @@ export {
 export {
   statsEmitter, trackPendingRequest, finishPendingRequest, finishActiveSession, getActiveRequests,
   saveRequestUsage, getUsageHistory, getUsageStats, getChartData,
-  getTodayConnectionRequestCounts,
+  getTodayConnectionTokenTotals,
   appendRequestLog, getRecentLogs,
   recordTokenSaverEvent, getTokenSaverStats,
   resetUsageHistory } from
