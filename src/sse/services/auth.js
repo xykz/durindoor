@@ -436,6 +436,15 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
   excludeConnectionIds :
   excludeConnectionIds ? new Set([excludeConnectionIds]) : new Set();
   const preferredConnectionId = options?.preferredConnectionId || null;
+  // Candidate pool: a non-empty list restricts selection to these ids (pool
+  // members still advance through affinity / lastUsedAt / token totals). An
+  // empty list is "no restriction". The legacy single pin normalizes to a
+  // one-element pool so both spellings share one eligibility filter.
+  const preferredConnectionIds = Array.isArray(options?.preferredConnectionIds) ?
+  options.preferredConnectionIds.filter(isString).filter(Boolean) : [];
+  const preferredPool = preferredConnectionIds.length > 0 ?
+  new Set(preferredConnectionIds) :
+  preferredConnectionId ? new Set([preferredConnectionId]) : null;
   // Acquire the provider-scoped selection turn. SQLite reservations, not this
   // mutex, remain the global capacity authority at dispatch time.
   const currentMutex = selectionMutexes.get(providerId) || Promise.resolve();
@@ -547,6 +556,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     // decolua/9router#3203: evaluate RPM without spending budget; record only final selection.
     const eligibleBeforeRpm = connections.filter((c) => {
       if (excludeSet.has(c.id)) return false;
+      if (preferredPool && !preferredPool.has(c.id)) return false;
       if (requestedModelLockActive(c, model, boundedModel, selectionNow)) return false;
       if (quotaDecisions.get(c.id)?.skip) return false;
       return true;

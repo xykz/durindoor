@@ -791,20 +791,37 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   body.connection_id ||
   null;
   let preferredConnectionId = null;
+  let preferredConnectionIds = null;
   if (rawConnectionPin) {
-    const requestedId = String(rawConnectionPin);
+    // A comma-separated list narrows the candidate pool (pool members still
+    // round-robin by token totals / lastUsedAt / affinity). A single id keeps
+    // the legacy hard-pin contract: exact match and terminal failure.
+    const requestedIds = [...new Set(
+      String(rawConnectionPin).
+      split(",").
+      map((value) => value.trim()).
+      filter(Boolean)
+    )];
     const canonicalProvider = resolveProviderId(provider);
     const activeConnections = await getProviderConnections({ provider: canonicalProvider, isActive: true });
-    const pinnedConnection = activeConnections.find((c) => c.id === requestedId);
-    if (!pinnedConnection) {
+    const activeIds = new Set(activeConnections.map((c) => c.id));
+    const matchedIds = requestedIds.filter((id) => activeIds.has(id));
+    if (matchedIds.length === 0) {
+      const requestedId = requestedIds[0] || "";
       log.warn("CHAT", `x-connection-id not found for provider ${canonicalProvider}: ${requestedId.slice(0, 8)}`);
       return errorResponse(
         HTTP_STATUS.BAD_REQUEST,
         `Connection ${requestedId.slice(0, 8)}... is not active for provider '${canonicalProvider}'.`
       );
     }
-    preferredConnectionId = pinnedConnection.id;
-    log.info("CHAT", `[${provider}/${model}] pinned to connection ${preferredConnectionId.slice(0, 8)}`);
+    preferredConnectionIds = matchedIds;
+    preferredConnectionId = matchedIds.length === 1 ? matchedIds[0] : null;
+    const pinSummary = matchedIds.map((id) => id.slice(0, 8)).join(",");
+    if (preferredConnectionId) {
+      log.info("CHAT", `[${provider}/${model}] pinned to connection ${pinSummary}`);
+    } else {
+      log.info("CHAT", `[${provider}/${model}] restricted to ${matchedIds.length} candidate connections ${pinSummary}`);
+    }
   }
   // Strip router-only connection pin from upstream request body.
   if (body.connectionId !== undefined || body.connection_id !== undefined) {
@@ -879,19 +896,22 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
           quotaFamily,
           resourceKeys: quotaResourceKeys,
           sessionId: routingSessionId,
-          preferredConnectionId: preferredConnectionId || requestReplayConnectionId
+          preferredConnectionId: preferredConnectionId || requestReplayConnectionId,
+          preferredConnectionIds: requestReplayConnectionId ? [requestReplayConnectionId] : preferredConnectionIds
         });
       } catch (error) {
         if (error?.name === "AbortError" || requestAborted(request, requestSignal)) return errorResponse(499, "Request aborted");
         throw error;
       }
 
-      // If the caller pinned a connection, the selected credential must match it
-      // exactly. Otherwise the account has been excluded/quota-blocked/rotated and
-      // the pin is no longer honored.
-      if (preferredConnectionId && credentials?.connectionId && credentials.connectionId !== preferredConnectionId) {
-        log.warn("CHAT", `[${provider}/${model}] pinned connection ${preferredConnectionId.slice(0, 8)} not selected; refusing rotation`);
-        return errorResponse(HTTP_STATUS.BAD_REQUEST, `Connection ${preferredConnectionId.slice(0, 8)}... is not available for provider '${provider}'.`);
+      // If the caller pinned a connection (or restricted the pool), the selected
+      // credential must fall inside it. Otherwise the account has been
+      // excluded/quota-blocked/rotated and the pin is no longer honored.
+      const pinScope = requestReplayConnectionId ? [requestReplayConnectionId] : preferredConnectionIds;
+      if (pinScope?.length && credentials?.connectionId && !pinScope.includes(credentials.connectionId)) {
+        const pinnedId = pinScope[0];
+        log.warn("CHAT", `[${provider}/${model}] pinned connection ${pinnedId.slice(0, 8)} not selected; refusing rotation`);
+        return errorResponse(HTTP_STATUS.BAD_REQUEST, `Connection ${pinnedId.slice(0, 8)}... is not available for provider '${provider}'.`);
       }
 
       // All accounts unavailable or provider disabled

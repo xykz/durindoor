@@ -123,9 +123,19 @@ beforeEach(() => {
     if (provider === "codex") return activeConnections;
     return [];
   });
-  mocks.getProviderCredentials.mockImplementation(async (_provider, _excluded, _model, { preferredConnectionId }) => {
-    if (preferredConnectionId) return selected(preferredConnectionId);
-    return selected("conn-one");
+  mocks.getProviderCredentials.mockImplementation(async (_provider, excluded, _model, { preferredConnectionId, preferredConnectionIds } = {}) => {
+    const excludedSet = excluded instanceof Set ? excluded : new Set(excluded ? [excluded] : []);
+    const pool = preferredConnectionIds?.length ?
+    preferredConnectionIds :
+    preferredConnectionId ? [preferredConnectionId] : null;
+    if (pool) {
+      const next = pool.find((id) => !excludedSet.has(id));
+      if (next) return selected(next);
+      return { allRateLimited: true, lastError: "Rate limit exceeded", lastErrorCode: 429, retryAfter: 1234567890 };
+    }
+    const fallback = ["conn-one", "conn-two"].find((id) => !excludedSet.has(id));
+    if (fallback) return selected(fallback);
+    return { allRateLimited: true, lastError: "Rate limit exceeded", lastErrorCode: 429, retryAfter: 1234567890 };
   });
   mocks.projectProviderCredentials.mockImplementation(async (conn, quota) => ({
     ...selected(conn.id),
@@ -253,5 +263,62 @@ describe("connection pinning", () => {
     const payload = await response.json();
     expect(payload.error.message).toContain("conn-two");
     expect(mocks.handleChatCore).not.toHaveBeenCalled();
+  });
+
+  it("passes a comma-separated candidate pool and selects a pool member", async () => {
+    await handleChat(request({}, { headers: { "x-connection-id": "conn-two, conn-one" } }));
+    expect(mocks.getProviderCredentials).toHaveBeenCalledWith(
+      "codex",
+      expect.any(Set),
+      "gpt-5.4",
+      expect.objectContaining({
+        preferredConnectionIds: ["conn-two", "conn-one"],
+        preferredConnectionId: null,
+      }),
+    );
+  });
+
+  it("keeps the active subset of the pool and ignores unknown ids", async () => {
+    const response = await handleChat(request({}, { headers: { "x-connection-id": "conn-one,ghost" } }));
+    expect(response.status).toBe(200);
+    expect(mocks.getProviderCredentials).toHaveBeenCalledWith(
+      "codex",
+      expect.any(Set),
+      "gpt-5.4",
+      expect.objectContaining({ preferredConnectionIds: ["conn-one"], preferredConnectionId: "conn-one" }),
+    );
+  });
+
+  it("returns 400 when no pool id is active for the provider", async () => {
+    const response = await handleChat(request({}, { headers: { "x-connection-id": "ghost,nope" } }));
+    expect(response.status).toBe(400);
+    expect(mocks.getProviderCredentials).not.toHaveBeenCalled();
+  });
+
+  it("rotates within the candidate pool when a pool member fails", async () => {
+    let attempt = 0;
+    mocks.handleChatCore.mockImplementation(async (options) => {
+      attempt += 1;
+      if (attempt === 1) {
+        return {
+          success: false,
+          status: 429,
+          error: "rate limit",
+          response: new Response(JSON.stringify({ error: "rate limit" }), { status: 429 }),
+        };
+      }
+      await options.onRequestSuccess();
+      return {
+        success: true,
+        response: new Response("data: {\"ok\":true}\n\ndata: [DONE]\n\n", {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        }),
+      };
+    });
+    const response = await handleChat(request({}, { headers: { "x-connection-id": "conn-one,conn-two" } }));
+    expect(response.status).toBe(200);
+    expect(mocks.handleChatCore).toHaveBeenCalledTimes(2);
+    expect(mocks.handleChatCore.mock.calls[1][0].connectionId).toBe("conn-two");
   });
 });
