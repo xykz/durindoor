@@ -141,11 +141,21 @@ function rememberSessionAffinity(providerId, sessionId, connectionId) {
   });
 }
 
-function getSessionAffinity(providerId, sessionId) {
+function getSessionAffinity(providerId, sessionId, ttlMs = MEMORY_CONFIG.sessionTtlMs) {
   if (!providerId || !sessionId) return null;
-  const entry = sessionAffinityState.get(sessionAffinityKey(providerId, sessionId));
-  if (entry) entry.lastUsed = Date.now();
-  return entry?.connectionId || null;
+  if (!(ttlMs > 0)) return null;
+  const key = sessionAffinityKey(providerId, sessionId);
+  const entry = sessionAffinityState.get(key);
+  if (!entry) return null;
+  // Enforce the TTL at read time: the periodic sweep runs on a coarse interval,
+  // so without this check a short per-request TTL would still pin until the next
+  // sweep. Sliding window: a live hit refreshes `lastUsed`.
+  if (Date.now() - entry.lastUsed > ttlMs) {
+    sessionAffinityState.delete(key);
+    return null;
+  }
+  entry.lastUsed = Date.now();
+  return entry.connectionId || null;
 }
 
 export function resetProviderSessionAffinity() {
@@ -436,6 +446,12 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
   excludeConnectionIds :
   excludeConnectionIds ? new Set([excludeConnectionIds]) : new Set();
   const preferredConnectionId = options?.preferredConnectionId || null;
+  // Optional per-request affinity TTL (ms). A finite >= 0 value overrides the
+  // global default; 0 disables affinity for this request. null/undefined keeps
+  // MEMORY_CONFIG.sessionTtlMs.
+  const sessionAffinityTtlMs = Number.isFinite(options?.sessionAffinityTtlMs) && options.sessionAffinityTtlMs >= 0 ?
+  options.sessionAffinityTtlMs :
+  MEMORY_CONFIG.sessionTtlMs;
   // Candidate pool: a non-empty list restricts selection to these ids (pool
   // members still advance through affinity / lastUsedAt / token totals). An
   // empty list is "no restriction". The legacy single pin normalizes to a
@@ -682,7 +698,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     // For round-robin, honor existing session affinity before quota ranking so
     // a session that already picked an account stays on it when it remains eligible.
     const stickyConnectionId = sessionId && strategy === "round-robin" ?
-    getSessionAffinity(providerId, sessionId) :
+    getSessionAffinity(providerId, sessionId, sessionAffinityTtlMs) :
     null;
     const stickyConnection = stickyConnectionId ?
     availableConnections.find((c) => c.id === stickyConnectionId) :

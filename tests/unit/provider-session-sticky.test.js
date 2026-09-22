@@ -114,4 +114,49 @@ describe("provider round-robin session affinity", () => {
     expect(first.connectionId).toBe("conn-a");
     expect(second.connectionId).toBe("conn-b");
   });
+
+  it("disables affinity for a request when the TTL override is zero", async () => {
+    const first = await getProviderCredentials("kiro", null, "claude-sonnet-4.5", {
+      sessionId: "hermes-thread-1",
+      sessionAffinityTtlMs: 0,
+    });
+    const second = await getProviderCredentials("kiro", null, "claude-sonnet-4.5", {
+      sessionId: "hermes-thread-1",
+      sessionAffinityTtlMs: 0,
+    });
+
+    // With affinity disabled the session re-balances via LRU instead of pinning.
+    expect(first.connectionId).toBe("conn-a");
+    expect(second.connectionId).toBe("conn-b");
+  });
+
+  it("treats an expired affinity entry as a miss under a per-request TTL", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-21T00:00:00.000Z"));
+      const first = await getProviderCredentials("kiro", null, "claude-sonnet-4.5", {
+        sessionId: "hermes-thread-1",
+        sessionAffinityTtlMs: 10 * 60 * 1000,
+      });
+      expect(first.connectionId).toBe("conn-a");
+
+      // Within the TTL the session stays sticky.
+      vi.setSystemTime(new Date("2026-09-21T00:05:00.000Z"));
+      const within = await getProviderCredentials("kiro", null, "claude-sonnet-4.5", {
+        sessionId: "hermes-thread-1",
+        sessionAffinityTtlMs: 10 * 60 * 1000,
+      });
+      expect(within.connectionId).toBe("conn-a");
+
+      // Past the TTL (and without any hit in between) the entry is stale.
+      vi.setSystemTime(new Date("2026-09-21T00:20:00.000Z"));
+      const expired = await getProviderCredentials("kiro", null, "claude-sonnet-4.5", {
+        sessionId: "hermes-thread-1",
+        sessionAffinityTtlMs: 10 * 60 * 1000,
+      });
+      expect(expired.connectionId).toBe("conn-b");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

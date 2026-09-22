@@ -128,6 +128,41 @@ function normalizeSessionId(value) {
   return v;
 }
 
+const AFFINITY_TTL_OFF_VALUES = new Set(["off", "none", "disabled", "disable", "no", "false"]);
+const AFFINITY_TTL_UNITS = { ms: 1, s: 1000, sec: 1000, m: 60_000, min: 60_000, h: 3_600_000 };
+const MAX_AFFINITY_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Parse the `x-session-affinity-ttl` header value into milliseconds.
+ *
+ * - `off` / `none` / `disable` / `false` / `0` → `0` (affinity disabled for this request)
+ * - bare number → seconds (e.g. `600` is 10 minutes)
+ * - suffixed number → that unit (`500ms`, `30s`, `10m`, `1h`)
+ * - blank or malformed → `null` (caller keeps the global default)
+ *
+ * @param {unknown} value - Raw header value.
+ * @returns {number|null} Non-negative millisecond TTL, or null to keep the default.
+ */
+export function parseSessionAffinityTtl(value) {
+  if (value == null) return null;
+  if (typeof value === "number") {
+    return Number.isFinite(value) && value >= 0 ?
+    Math.min(Math.round(value * 1000), MAX_AFFINITY_TTL_MS) :
+    null;
+  }
+  if (!isString(value)) return null;
+  const text = value.trim().toLowerCase();
+  if (!text) return null;
+  if (AFFINITY_TTL_OFF_VALUES.has(text)) return 0;
+  const match = text.match(/^(\d+(?:\.\d+)?)\s*(ms|sec|min|s|m|h)?$/);
+  if (!match) return null;
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount) || amount < 0) return null;
+  if (amount === 0) return 0;
+  const unitMs = match[2] ? AFFINITY_TTL_UNITS[match[2]] : 1000;
+  return Math.min(Math.round(amount * unitMs), MAX_AFFINITY_TTL_MS);
+}
+
 // Extract Claude Code session id from metadata.user_id (_session_{uuid} | JSON {session_id})
 function extractClaudeCodeSession(userId) {
   if (!isString(userId) || !userId) return null;

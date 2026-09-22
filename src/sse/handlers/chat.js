@@ -40,7 +40,7 @@ import { EMPTY_CONTENT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
 import { detectFormat } from "open-sse/services/provider.js";
 import { isAntigravityCapacityError, isRequestReplayBufferError } from "open-sse/services/accountFallback.js";
-import { resolveClientSessionId } from "open-sse/utils/sessionManager.js";
+import { resolveClientSessionId, parseSessionAffinityTtl } from "open-sse/utils/sessionManager.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials } from "../services/tokenRefresh.js";
 import { refreshAndUpdateCredentials } from "@/shared/services/providerCredentials";
@@ -849,6 +849,12 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     scope: provider
   });
 
+  // Per-request session-affinity TTL override (e.g. `x-session-affinity-ttl: 10m`
+  // or `off`). Missing/malformed leaves the global default in place.
+  const sessionAffinityTtlMs = parseSessionAffinityTtl(
+    clientRawRequest?.headers?.["x-session-affinity-ttl"]
+  );
+
   // Resolve request-scoped custom capabilities once, just before the retry loop.
   // Custom model aliases are stored by provider prefix; requestPrefix carries
   // the prefix the caller actually used (e.g. node alias or bare model alias).
@@ -897,7 +903,8 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
           resourceKeys: quotaResourceKeys,
           sessionId: routingSessionId,
           preferredConnectionId: preferredConnectionId || requestReplayConnectionId,
-          preferredConnectionIds: requestReplayConnectionId ? [requestReplayConnectionId] : preferredConnectionIds
+          preferredConnectionIds: requestReplayConnectionId ? [requestReplayConnectionId] : preferredConnectionIds,
+          sessionAffinityTtlMs
         });
       } catch (error) {
         if (error?.name === "AbortError" || requestAborted(request, requestSignal)) return errorResponse(499, "Request aborted");

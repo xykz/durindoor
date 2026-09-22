@@ -1,6 +1,6 @@
 // A2: locks resolveSessionId priority/stickiness (codex/kiro/antigravity centralization).
 import { describe, it, expect, beforeEach } from "vitest";
-import { resolveClientSessionId, resolveSessionId, deriveSessionId, clearSessionStore } from "../../open-sse/utils/sessionManager.js";
+import { resolveClientSessionId, resolveSessionId, deriveSessionId, clearSessionStore, parseSessionAffinityTtl } from "../../open-sse/utils/sessionManager.js";
 
 // Assistant text must reach ASSISTANT_MIN_LEN (80) to use assistant anchor; else first user message.
 const longAssistant = "x".repeat(80);
@@ -112,5 +112,38 @@ describe("session store eviction", () => {
 
     expect(idFor(0)).toBe(hotId);
     expect(idFor(1)).not.toBe(lruId);
+  });
+});
+
+describe("parseSessionAffinityTtl", () => {
+  it("returns null for blank or malformed values so the global default applies", () => {
+    expect(parseSessionAffinityTtl(undefined)).toBeNull();
+    expect(parseSessionAffinityTtl(null)).toBeNull();
+    expect(parseSessionAffinityTtl("")).toBeNull();
+    expect(parseSessionAffinityTtl("   ")).toBeNull();
+    expect(parseSessionAffinityTtl("soon")).toBeNull();
+    expect(parseSessionAffinityTtl("-5")).toBeNull();
+  });
+
+  it("maps off-like values to zero", () => {
+    for (const value of ["off", "none", "disabled", "false", "0", "OFF", " Off "]) {
+      expect(parseSessionAffinityTtl(value)).toBe(0);
+    }
+  });
+
+  it("treats a bare number as seconds", () => {
+    expect(parseSessionAffinityTtl("600")).toBe(600_000);
+    expect(parseSessionAffinityTtl(600)).toBe(600_000);
+  });
+
+  it("honors explicit units", () => {
+    expect(parseSessionAffinityTtl("500ms")).toBe(500);
+    expect(parseSessionAffinityTtl("30s")).toBe(30_000);
+    expect(parseSessionAffinityTtl("10m")).toBe(600_000);
+    expect(parseSessionAffinityTtl("1h")).toBe(3_600_000);
+  });
+
+  it("caps an oversized TTL at one day", () => {
+    expect(parseSessionAffinityTtl("100h")).toBe(24 * 60 * 60 * 1000);
   });
 });
