@@ -9,7 +9,7 @@ const mocks = vi.hoisted(() => ({
   getProxyPools: vi.fn(),
   getQuotaFetchState: vi.fn(),
   getQuotaReservationPressure: vi.fn(),
-  getTodayConnectionTokenTotals: vi.fn(),
+  getConnectionTokenTotals24h: vi.fn(),
   validateApiKey: vi.fn(),
 }));
 
@@ -22,7 +22,7 @@ vi.mock("@/lib/localDb", () => ({
   validateApiKey: mocks.validateApiKey,
   getQuotaFetchState: mocks.getQuotaFetchState,
   getQuotaReservationPressure: mocks.getQuotaReservationPressure,
-  getTodayConnectionTokenTotals: mocks.getTodayConnectionTokenTotals,
+  getConnectionTokenTotals24h: mocks.getConnectionTokenTotals24h,
 }));
 
 const { getProviderCredentials } = await import("../../src/sse/services/auth.js");
@@ -104,7 +104,7 @@ describe("quota-aware provider selection", () => {
     mocks.getProxyPools.mockResolvedValue([]);
     mocks.getQuotaFetchState.mockResolvedValue(null);
     mocks.getQuotaReservationPressure.mockResolvedValue(new Map());
-    mocks.getTodayConnectionTokenTotals.mockResolvedValue(new Map());
+    mocks.getConnectionTokenTotals24h.mockResolvedValue(new Map());
     mocks.updateProviderConnection.mockImplementation(async (id, patch) => ({
       ...connection(id, id === "one" ? 1 : 2),
       ...patch,
@@ -289,7 +289,7 @@ describe("quota-aware provider selection", () => {
     expect(selected.connectionId).toBe("one");
   });
 
-  it("codebuddy-cn balances round-robin by today's token total", async () => {
+  it("codebuddy-cn balances round-robin by the rolling-24h token total", async () => {
     // "two" is the most recently used account, but "one" has burned far fewer
     // tokens today, so the new session must land on "one".
     mocks.getProviderConnections.mockResolvedValue([
@@ -297,7 +297,7 @@ describe("quota-aware provider selection", () => {
       { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
     ]);
     mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin", stickyRoundRobinLimit: 1 });
-    mocks.getTodayConnectionTokenTotals.mockResolvedValue(new Map([["one", 2_000], ["two", 10_000]]));
+    mocks.getConnectionTokenTotals24h.mockResolvedValue(new Map([["one", 2_000], ["two", 10_000]]));
 
     const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
       now: NOW,
@@ -305,16 +305,16 @@ describe("quota-aware provider selection", () => {
     });
 
     expect(selected.connectionId).toBe("one");
-    expect(mocks.getTodayConnectionTokenTotals).toHaveBeenCalledWith(["one", "two"], expect.any(Date));
+    expect(mocks.getConnectionTokenTotals24h).toHaveBeenCalledWith(["one", "two"], expect.any(Date));
   });
 
-  it("codebuddy-cn falls back to lastUsedAt when today's token totals tie", async () => {
+  it("codebuddy-cn falls back to lastUsedAt when rolling-24h token totals tie", async () => {
     mocks.getProviderConnections.mockResolvedValue([
       { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
       { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
     ]);
     mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin", stickyRoundRobinLimit: 1 });
-    mocks.getTodayConnectionTokenTotals.mockResolvedValue(new Map([["one", 5_000], ["two", 5_000]]));
+    mocks.getConnectionTokenTotals24h.mockResolvedValue(new Map([["one", 5_000], ["two", 5_000]]));
 
     const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
       now: NOW,
@@ -330,7 +330,7 @@ describe("quota-aware provider selection", () => {
       { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
     ]);
     mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin", stickyRoundRobinLimit: 1 });
-    mocks.getTodayConnectionTokenTotals.mockRejectedValue(new Error("db unavailable"));
+    mocks.getConnectionTokenTotals24h.mockRejectedValue(new Error("db unavailable"));
 
     const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
       now: NOW,
@@ -352,7 +352,60 @@ describe("quota-aware provider selection", () => {
       sessionId: "sess-codex",
     });
 
-    expect(mocks.getTodayConnectionTokenTotals).not.toHaveBeenCalled();
+    expect(mocks.getConnectionTokenTotals24h).not.toHaveBeenCalled();
+  });
+
+  it("codebuddy-cn skips an account at or above the request token budget", async () => {
+    mocks.getProviderConnections.mockResolvedValue([
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin", stickyRoundRobinLimit: 1 });
+    mocks.getConnectionTokenTotals24h.mockResolvedValue(new Map([["one", 180_000_000], ["two", 5_000]]));
+
+    const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+      now: NOW,
+      sessionId: "sess-cbcn-budget",
+      connectionTokenBudget: 180_000_000,
+    });
+
+    expect(selected.connectionId).toBe("two");
+    expect(mocks.getConnectionTokenTotals24h).toHaveBeenCalledTimes(1);
+  });
+
+  it("codebuddy-cn returns allRateLimited/503 when every account reaches the token budget", async () => {
+    mocks.getProviderConnections.mockResolvedValue([
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin", stickyRoundRobinLimit: 1 });
+    mocks.getConnectionTokenTotals24h.mockResolvedValue(new Map([["one", 190_000_000], ["two", 181_000_000]]));
+
+    const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+      now: NOW,
+      sessionId: "sess-cbcn-budget-all",
+      connectionTokenBudget: 180_000_000,
+    });
+
+    expect(selected.allRateLimited).toBe(true);
+    expect(selected.lastErrorCode).toBe(503);
+  });
+
+  it("ignores the token budget for non-codebuddy providers", async () => {
+    mocks.getProviderConnections.mockResolvedValue([
+      { ...connection("one", 1), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
+      connection("two", 2),
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin", stickyRoundRobinLimit: 1 });
+
+    const selected = await getProviderCredentials("codex", null, "gpt-5.4", {
+      now: NOW,
+      sessionId: "sess-codex-budget",
+      connectionTokenBudget: 1,
+    });
+
+    expect(selected.connectionId).toBeDefined();
+    expect(mocks.getConnectionTokenTotals24h).not.toHaveBeenCalled();
   });
 
   it("projects the committed round-robin revision instead of the stale selected row", async () => {

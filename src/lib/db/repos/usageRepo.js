@@ -540,32 +540,48 @@ export async function getUsageHistory(filter = {}) {
 }
 
 /**
- * Lightweight per-connection token totals for the current local calendar day.
+ * Per-connection token totals over a rolling 24-hour window.
  *
- * Reads the already-aggregated `usageDaily.byAccount` rollup (keyed by
- * connectionId) instead of scanning usageHistory, so it is cheap enough for the
- * credential-selection hot path. The value matches the dashboard's "Total
- * Tokens" definition (`promptTokens + completionTokens`). This is a read-only
- * balancing signal, never an eligibility filter: missing rows/accounts resolve
- * to 0 and any failure is swallowed to an empty map so callers fall back to
- * their existing ordering.
+ * Aggregates `usageHistory` (promptTokens + completionTokens, matching the
+ * dashboard "Total Tokens" definition) for the trailing 24 hours ending at
+ * `now`, instead of the local calendar day. A rolling window is required for
+ * account budgets that reset on demand (e.g. CodeBuddy CN throttles an account
+ * once its 24h total nears 2e8 tokens) because a midnight rollover must not
+ * zero a still-hot account.
+ *
+ * Indexed by `idx_uh_conn` / `idx_uh_ts`. This is a read-only balancing and
+ * budget signal; missing rows/accounts resolve to 0 and any failure is swallowed
+ * to an all-zero map so callers fall back to their existing ordering.
  *
  * @param {Iterable<string>} connectionIds
  * @param {Date} [now]
+ * @param {number} [windowMs] - Trailing window length; defaults to 24h.
  * @returns {Promise<Map<string, number>>}
  */
-export async function getTodayConnectionTokenTotals(connectionIds, now = new Date()) {
+export async function getConnectionTokenTotals24h(connectionIds, now = new Date(), windowMs = 24 * 60 * 60 * 1000) {
   const ids = [...new Set((connectionIds || []).filter((id) => isString(id) && id))];
   const totals = new Map(ids.map((id) => [id, 0]));
   if (ids.length === 0) return totals;
   try {
     const db = await getAdapter();
-    const row = db.get(`SELECT data FROM usageDaily WHERE dateKey = ?`, [toLocalDateKey(now)]);
-    const byAccount = parseJson(row?.data, {}).byAccount;
-    if (!isObject(byAccount)) return totals;
-    for (const id of ids) {
-      const entry = isObject(byAccount[id]) ? byAccount[id] : {};
-      const total = Number(entry.promptTokens || 0) + Number(entry.completionTokens || 0);
+    const toMs = new Date(now).getTime();
+    const sinceIso = new Date(toMs - windowMs).toISOString();
+    const untilIso = new Date(toMs).toISOString();
+    const placeholders = ids.map(() => "?").join(",");
+    const rows = db.all(
+      `SELECT connectionId,
+              SUM(COALESCE(promptTokens, 0) + COALESCE(completionTokens, 0)) AS total
+         FROM usageHistory
+        WHERE connectionId IN (${placeholders})
+          AND timestamp >= ?
+          AND timestamp <= ?
+        GROUP BY connectionId`,
+      [...ids, sinceIso, untilIso]
+    );
+    for (const row of rows || []) {
+      const id = row?.connectionId;
+      if (!isString(id) || !totals.has(id)) continue;
+      const total = Number(row.total);
       totals.set(id, Number.isFinite(total) && total > 0 ? total : 0);
     }
   } catch {

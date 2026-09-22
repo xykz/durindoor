@@ -2,7 +2,7 @@ import { isFreeNoAuthProviderDisabled } from "@/sse/services/freeProviderGate.js
 import {
   getProviderConnections, getProviderConnectionById, getApiKeyByKey, validateApiKey,
   updateProviderConnection, getSettings, getProxyPools,
-  getQuotaReservationPressure, getTodayConnectionTokenTotals } from
+  getQuotaReservationPressure, getConnectionTokenTotals24h } from
 "@/lib/localDb";
 import { MEMORY_CONFIG } from "open-sse/config/runtimeConfig.js";
 import { isApiKeyExpired } from "@/shared/utils/apiKeyExpiry";
@@ -461,6 +461,15 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
   const preferredPool = preferredConnectionIds.length > 0 ?
   new Set(preferredConnectionIds) :
   preferredConnectionId ? new Set([preferredConnectionId]) : null;
+  // Optional per-request rolling-24h token budget (codebuddy-cn only). Accounts
+  // whose trailing-24h total reaches this value are dropped from the candidate
+  // pool before RPM/quota evaluation, because the upstream throttles once the
+  // daily total nears its cap. null/undefined = no budget (legacy behavior).
+  const connectionTokenBudget = providerId === "codebuddy-cn" &&
+  Number.isFinite(options?.connectionTokenBudget) &&
+  options.connectionTokenBudget > 0 ?
+  Math.floor(options.connectionTokenBudget) :
+  null;
   // Acquire the provider-scoped selection turn. SQLite reservations, not this
   // mutex, remain the global capacity authority at dispatch time.
   const currentMutex = selectionMutexes.get(providerId) || Promise.resolve();
@@ -569,10 +578,29 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       log.warn("AUTH", `No credentials for ${provider}`);
       return null;
     }
+    // Rolling-24h per-account token totals. Needed for two things:
+    //   1. the optional per-request budget filter below (codebuddy-cn), and
+    //   2. round-robin balancing (codebuddy-cn) so a hot account is not latched.
+    // Fetched once here and reused by pickOldest; a read failure leaves an empty
+    // map so both consumers fall back to lastUsedAt/priority ordering.
+    const budgetedOutIds = new Set();
+    let connectionTokenTotals = null;
+    if (connectionTokenBudget != null) {
+      connectionTokenTotals = await getConnectionTokenTotals24h(
+        connections.map((c) => c.id),
+        new Date(selectionNow)
+      ).catch(() => null);
+      if (connectionTokenTotals) {
+        for (const [id, total] of connectionTokenTotals) {
+          if (total >= connectionTokenBudget) budgetedOutIds.add(id);
+        }
+      }
+    }
     // decolua/9router#3203: evaluate RPM without spending budget; record only final selection.
     const eligibleBeforeRpm = connections.filter((c) => {
       if (excludeSet.has(c.id)) return false;
       if (preferredPool && !preferredPool.has(c.id)) return false;
+      if (budgetedOutIds.has(c.id)) return false;
       if (requestedModelLockActive(c, model, boundedModel, selectionNow)) return false;
       if (quotaDecisions.get(c.id)?.skip) return false;
       return true;
@@ -584,11 +612,12 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     log.debug("AUTH", `${provider} | available: ${availableConnections.length}/${connections.length}`);
     connections.forEach((c) => {
       const excluded = excludeSet.has(c.id);
+      const budgeted = budgetedOutIds.has(c.id);
       const locked = requestedModelLockActive(c, model, boundedModel, selectionNow);
       const quotaBlocked = quotaDecisions.get(c.id)?.skip === true;
       const rpmBlocked = isOverLimit(c.id, rpmLimit, selectionNow);
-      if (excluded || locked || quotaBlocked || rpmBlocked) {
-        log.debug("AUTH", `  → ${c.id?.slice(0, 8)} | ${excluded ? "excluded" : ""} ${locked ? "legacy_lock" : ""} ${quotaBlocked ? `quota_${quotaDecisions.get(c.id).reason}` : ""} ${rpmBlocked ? `rpm_${rpmLimit}` : ""}`);
+      if (excluded || budgeted || locked || quotaBlocked || rpmBlocked) {
+        log.debug("AUTH", `  → ${c.id?.slice(0, 8)} | ${excluded ? "excluded" : ""} ${budgeted ? "token_budget" : ""} ${locked ? "legacy_lock" : ""} ${quotaBlocked ? `quota_${quotaDecisions.get(c.id).reason}` : ""} ${rpmBlocked ? `rpm_${rpmLimit}` : ""}`);
       }
     });
 
@@ -609,6 +638,23 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       if (rpmSummary) {
         log.warn("AUTH", `${provider} | all ${rpmCandidates.length} accounts at ${rpmLimit} RPM cap`);
         return rpmSummary;
+      }
+      // Every account still in scope is over the request's rolling-24h token
+      // budget. Surface a terminal 503 rather than selecting a throttled account.
+      const scopedCandidates = connections.filter(
+        (c) => !excludeSet.has(c.id) && (!preferredPool || preferredPool.has(c.id))
+      );
+      if (budgetedOutIds.size > 0 &&
+      scopedCandidates.length > 0 &&
+      scopedCandidates.every((c) => budgetedOutIds.has(c.id))) {
+        log.warn("AUTH", `${provider} | all ${scopedCandidates.length} accounts reached the 24h token budget`);
+        return {
+          allRateLimited: true,
+          retryAfter: null,
+          retryAfterHuman: "",
+          lastError: `All ${provider} accounts reached the 24h token budget (${connectionTokenBudget})`,
+          lastErrorCode: 503
+        };
       }
       // Find earliest lock expiry across all connections for retry timing
       const blockedConns = connections.filter(
@@ -676,22 +722,24 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     }
 
     let connection;
-    // codebuddy-cn only: balance round-robin first-pick by today's per-account
-    // token total so a long-idle account is not latched by every new session.
-    // Read-only signal; a null/empty map (other providers, day rollover, read
-    // failure) leaves the existing lastUsedAt/priority ordering untouched.
-    const usageTotals = providerId === "codebuddy-cn" && strategy === "round-robin" ?
-    await getTodayConnectionTokenTotals(
+    // codebuddy-cn only: balance round-robin first-pick by the rolling-24h
+    // per-account token total so a long-idle account is not latched by every new
+    // session. Reuse the map already loaded for the budget filter when present;
+    // otherwise fetch it once. Read-only signal; a null/empty map (other
+    // providers, read failure) leaves lastUsedAt/priority ordering untouched.
+    const usageTotals = connectionTokenTotals ||
+    (providerId === "codebuddy-cn" && strategy === "round-robin" ?
+    await getConnectionTokenTotals24h(
       availableConnections.map((candidate) => candidate.id),
       new Date(selectionNow)
     ).catch(() => null) :
-    null;
+    null);
     // Selection precedence:
     //   1. explicit preferredConnectionId pin
     //   2. round-robin session affinity (a session keeps its account)
     //   3. quota-ranked top candidate, but only for NON round-robin strategies
     //   4. round-robin advance by lastUsedAt (LRU), or fill-first priority order
-    //      (codebuddy-cn refines step 4 with today's token total)
+    //      (codebuddy-cn refines step 4 with the rolling-24h token total)
     // Round-robin deliberately ignores the quota rank for the final pick: quota
     // only reorders the pool/eligibility above, so a saturated ranking (every
     // account comparable at ratio 1.0) cannot pin one account for every session.

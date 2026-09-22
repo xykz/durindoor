@@ -34,5 +34,5 @@ export {
   getPricing, getPricingForModel, updatePricing, resetPricing, resetAllPricing,
   exportDb, importDb,
   saveRequestUsage,
-  getTodayConnectionTokenTotals,
+  getConnectionTokenTotals24h,
 } from "@/lib/db/index.js";

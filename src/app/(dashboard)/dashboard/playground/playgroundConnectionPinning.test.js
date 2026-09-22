@@ -321,4 +321,24 @@ describe("connection pinning", () => {
     expect(mocks.handleChatCore).toHaveBeenCalledTimes(2);
     expect(mocks.handleChatCore.mock.calls[1][0].connectionId).toBe("conn-two");
   });
+
+  it("parses x-connection-token-budget and forwards it to selection", async () => {
+    await handleChat(request({}, { headers: { "x-connection-token-budget": "180m" } }));
+    expect(mocks.getProviderCredentials).toHaveBeenCalledWith(
+      "codex",
+      expect.any(Set),
+      "gpt-5.4",
+      expect.objectContaining({ connectionTokenBudget: 180_000_000 }),
+    );
+  });
+
+  it("leaves the token budget unset for a malformed header", async () => {
+    await handleChat(request({}, { headers: { "x-connection-token-budget": "lots" } }));
+    expect(mocks.getProviderCredentials).toHaveBeenCalledWith(
+      "codex",
+      expect.any(Set),
+      "gpt-5.4",
+      expect.objectContaining({ connectionTokenBudget: null }),
+    );
+  });
 });

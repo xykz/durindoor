@@ -41,6 +41,7 @@ import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
 import { detectFormat } from "open-sse/services/provider.js";
 import { isAntigravityCapacityError, isRequestReplayBufferError } from "open-sse/services/accountFallback.js";
 import { resolveClientSessionId, parseSessionAffinityTtl } from "open-sse/utils/sessionManager.js";
+import { parseTokenBudget } from "@/shared/utils/tokenBudget.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials } from "../services/tokenRefresh.js";
 import { refreshAndUpdateCredentials } from "@/shared/services/providerCredentials";
@@ -855,6 +856,13 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     clientRawRequest?.headers?.["x-session-affinity-ttl"]
   );
 
+  // Per-request rolling-24h token budget for account selection (codebuddy-cn
+  // only). `x-connection-token-budget: 180000000` / `180m` stops the router from
+  // selecting an account once its trailing-24h total reaches the budget.
+  const connectionTokenBudget = parseTokenBudget(
+    clientRawRequest?.headers?.["x-connection-token-budget"]
+  );
+
   // Resolve request-scoped custom capabilities once, just before the retry loop.
   // Custom model aliases are stored by provider prefix; requestPrefix carries
   // the prefix the caller actually used (e.g. node alias or bare model alias).
@@ -904,7 +912,8 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
           sessionId: routingSessionId,
           preferredConnectionId: preferredConnectionId || requestReplayConnectionId,
           preferredConnectionIds: requestReplayConnectionId ? [requestReplayConnectionId] : preferredConnectionIds,
-          sessionAffinityTtlMs
+          sessionAffinityTtlMs,
+          connectionTokenBudget
         });
       } catch (error) {
         if (error?.name === "AbortError" || requestAborted(request, requestSignal)) return errorResponse(499, "Request aborted");

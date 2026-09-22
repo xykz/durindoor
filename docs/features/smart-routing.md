@@ -61,6 +61,18 @@ For round-robin providers, behavior depends on whether a stable client session i
 
 Generated connection sessions and assistant-anchored conversation sessions are also bounded in memory. Reads refresh their recency, so reaching the 1,000-connection or 5,000-conversation safety cap evicts the least-recently-used entry rather than rotating an active session and losing its warm prompt cache.
 
+Two per-request headers tune account selection:
+
+- `x-connection-id` accepts either one connection id (a hard pin: the request fails rather than rotating if that account is unavailable) or a comma-separated list (a candidate pool: selection still round-robins within the pool, and a member failure rotates to the next pool member; if no pool member is available the request fails rather than falling back outside the pool).
+- `x-session-affinity-ttl` overrides the session-affinity TTL for that request. A bare number is seconds (`600`), explicit units are honored (`500ms`, `30s`, `10m`, `1h`), and `off`/`none`/`disabled`/`0` disables affinity so the request re-balances immediately. Missing or malformed values keep the default. Expiry stays sliding: an active session keeps refreshing its entry.
+
+### CodeBuddy CN token budget
+
+CodeBuddy CN throttles an account once its trailing 24-hour token total approaches roughly 2×10⁸ tokens. Two mechanisms keep traffic inside that ceiling:
+
+- **Rolling-24h balancing.** New round-robin sessions prefer the account with the lowest `promptTokens + completionTokens` over the trailing 24 hours (from `usageHistory`), falling back to `lastUsedAt`/`priority` on ties or read failure. This uses a rolling window rather than a calendar day so a midnight rollover cannot reset a still-hot account.
+- **Per-request budget.** The `x-connection-token-budget` header (bare counts or `k`/`m`/`b` suffixes, e.g. `180m` or `180000000`) drops any account at or above that trailing-24h total from the candidate pool. If every account in scope reaches the budget, selection returns a 503 `allRateLimited` rather than routing to a throttled account. The budget applies to CodeBuddy CN only; without the header there is no budget.
+
 ## Request Translation
 
 Client tools do not all speak the same format. DurinDoor translates between OpenAI, Anthropic Claude, Gemini, OpenAI Responses, Kiro, Cursor, CommandCode, Ollama, Vertex, and other supported shapes.
