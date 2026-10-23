@@ -1,6 +1,14 @@
 import { DefaultExecutor } from "./default.js";
 import { OPENAI_BLOCK, ROLE } from "../translator/schema/index.js";
 import { isString } from "../../src/shared/utils/typeChecks.js";
+import {
+  codebuddyCacheRetention,
+  codebuddyCliAlignmentEnabled,
+  codebuddyCliVersion,
+  codebuddyConversationId,
+  codebuddyRequestId,
+  codebuddyUserAgent,
+} from "../providers/codebuddyCli.js";
 
 const DEFAULT_SYSTEM_PROMPT_MAX_LEN = 2000;
 const NEUTRAL_PROMPT = "You are a helpful AI assistant that helps with software engineering tasks.";
@@ -82,7 +90,47 @@ export class CodeBuddyExecutor extends DefaultExecutor {
     // No reasoning requested: leave both unset. Forcing reasoning_effort:"medium"
     // + reasoning_summary on plain requests makes CodeBuddy trip its content
     // filter and return an error (#2071).
+
+    // The official CLI stamps every chat request with a cache retention mode,
+    // latching "long" unless CODEBUDDY_DISABLE_PROMPT_CACHING_1H is set. An
+    // explicit client value always wins. See providers/codebuddyCli.js.
+    if (codebuddyCliAlignmentEnabled() && transformed.cache_retention === undefined) {
+      transformed.cache_retention = codebuddyCacheRetention();
+    }
     return transformed;
+  }
+
+  /**
+   * Mirror the conversation/request identity headers the official CLI attaches
+   * to every chat request (observed against @tencent-ai/codebuddy-code 2.172.1).
+   *
+   * The CLI derives these from its session object; DurinDoor has no session, so
+   * the conversation id is derived from the gateway's own session id and the
+   * request ids are minted per attempt. Headers the CLI sends from authenticated
+   * identity state (X-Userinfo, X-Enterprise-Id, X-Auth-Method, X-Id-Source) are
+   * intentionally NOT synthesized — see docs/providers/codebuddy-cn.md.
+   */
+  buildHeaders(credentials = {}, stream = true, requestContext = null) {
+    const headers = super.buildHeaders(credentials, stream);
+    if (!requestContext || !codebuddyCliAlignmentEnabled()) return headers;
+
+    const seed = requestContext.sessionId || credentials?.connectionId || null;
+    if (!seed) return headers; // nothing to anchor a conversation on
+
+    const messageId = codebuddyRequestId();
+    headers["User-Agent"] = codebuddyUserAgent();
+    headers["X-IDE-Version"] = codebuddyCliVersion();
+    headers["X-Conversation-ID"] = codebuddyConversationId(seed);
+    // The CLI reuses one message id for the request/message pair and a
+    // dash-stripped uuid for X-Request-ID.
+    headers["X-Conversation-Request-ID"] = messageId;
+    headers["X-Conversation-Message-ID"] = messageId;
+    headers["X-Request-ID"] = messageId;
+    // CLI defaults when the session carries no mode/team/parent metadata.
+    headers["X-Agent-Intent"] = "craft";
+    headers["X-Agent-Runtime"] = "other";
+    headers["X-Agent-Type"] = "main";
+    return headers;
   }
 }
 
