@@ -27,9 +27,19 @@ vi.mock("@/lib/localDb", () => ({
   getQuotaReservationPressure: vi.fn(async () => new Map()),
 }));
 
+// chat.js imports getComboModels, getModelInfo, getComboCanonicalName,
+// loadCustomCapabilities, and parseModel from this module. A partial mock
+// makes every case in this file die at import time with
+// `No "<name>" export is defined on the mock`, so all five must be present.
 vi.mock("../../../../sse/services/model.js", () => ({
   getComboModels: mocks.getComboModels,
   getModelInfo: mocks.getModelInfo,
+  // No provider-prefixed custom alias in these fixtures: a null providerAlias
+  // reproduces the bare-model path the pinned-connection cases exercise.
+  parseModel: vi.fn((modelStr) => ({ providerAlias: null, model: modelStr })),
+  getComboCanonicalName: vi.fn((modelStr) => modelStr),
+  loadCustomCapabilities: vi.fn(async () => ({})),
+  createRoutableModelIdChecker: vi.fn(() => () => true),
 }));
 
 vi.mock("../../../../sse/services/auth.js", () => ({
