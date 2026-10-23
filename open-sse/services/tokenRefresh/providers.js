@@ -5,7 +5,7 @@ import { buildKiroOidcEndpoint, KIRO_DEFAULT_REGION } from "../../config/kiroReg
 import { dedupRefresh } from "./dedup.js";
 import { buildExternalIdpRefreshParams } from "../../../src/lib/oauth/kiroExternalIdp.js";
 import { sanitizeErrorMessage } from "../../utils/error.js";
-import { isString } from "../../../src/shared/utils/typeChecks.js";
+import { isString, isNumber, isObject } from "../../../src/shared/utils/typeChecks.js";
 
 function safeRefreshError(value) {
   if (isString(value)) return sanitizeErrorMessage(value);
@@ -648,57 +648,123 @@ export async function refreshCopilotToken(githubAccessToken, log, proxyOptions =
     }
   }, log, proxyOptions);
 }
+// CodeBuddy (Tencent) CN refresh — POST /v2/plugin/auth/token/refresh with the
+// refresh token carried in the X-Refresh-Token header (not a form body), plus
+// X-Auth-Refresh-Source: plugin and X-Domain: <endpoint host>. This mirrors
+// `refreshSession` in the official @tencent-ai/codebuddy-code CLI: no
+// Authorization header, an empty `{}` body, only `data.data` presence checked,
+// and 401/403 treated as a dead grant (re-auth) rather than a transient blip.
+// Success envelope: { code: 0, data: <token> }.
+const CODEBUDDY_FALLBACK_DOMAIN = "copilot.tencent.com";
 
-// CodeBuddy (Tencent) refresh — POST /v2/plugin/auth/token/refresh with the
-// refresh token carried in the X-Refresh-Token header (not a form body),
-// matching the official CodeBuddy CLI. Response: { code: 0, data: <token> }.
+// The official client derives X-Domain from the configured endpoint authority
+// (`URI.parse(this.endpoint).authority`); do the same from the registry so a
+// deployment that retargets baseUrl is not pinned to a stale host.
+function codebuddyRefreshDomain(oauth) {
+  const baseUrl = oauth?.baseUrl || PROVIDERS["codebuddy-cn"]?.baseUrl;
+  if (!baseUrl) return CODEBUDDY_FALLBACK_DOMAIN;
+  try {
+    const hostname = new URL(baseUrl).hostname;
+    return hostname || CODEBUDDY_FALLBACK_DOMAIN;
+  } catch {
+    return CODEBUDDY_FALLBACK_DOMAIN;
+  }
+}
+
+// src/shared/services/providerCredentials.js rejects a non-positive,
+// fractional, or non-numeric lifetime as a malformed refresh result, so only a
+// usable `expiresIn` is forwarded and `expiresAt` is kept as the fallback —
+// matching the official `calculateExpiresAt`, which ignores a falsy expiresIn.
+function codebuddyExpiresIn(value) {
+  if (isNumber(value) && Number.isInteger(value) && value > 0) return value;
+  if (isString(value) && /^[1-9]\d{0,9}$/.test(value)) return Number(value);
+  return null;
+}
+
+function codebuddyExpiresAt(value) {
+  if (isNumber(value)) return Number.isFinite(value) && value > 0 ? value : null;
+  if (isString(value) && value) {
+    const parsed = new Date(value).getTime();
+    if (Number.isFinite(parsed) && parsed > 0) return value;
+  }
+  return null;
+}
+
 export async function refreshCodebuddyToken(refreshToken, log, proxyOptions = null) {
   if (!refreshToken) return null;
   return dedupRefresh("codebuddy-cn", refreshToken, async () => {
-    const oauth = PROVIDER_OAUTH["codebuddy-cn"] || {};
-    const response = await proxyAwareFetch(oauth.refreshUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        "User-Agent": oauth.userAgent,
-        "X-Requested-With": "XMLHttpRequest",
-        "X-Domain": "copilot.tencent.com",
-        "X-Refresh-Token": refreshToken,
-        "X-Auth-Refresh-Source": "plugin",
-        "X-Product": "SaaS"
-      },
-      body: "{}"
-    }, proxyOptions);
+    try {
+      const oauth = PROVIDER_OAUTH["codebuddy-cn"] || {};
+      const response = await proxyAwareFetch(oauth.refreshUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          "User-Agent": oauth.userAgent,
+          "X-Requested-With": "XMLHttpRequest",
+          "X-Domain": codebuddyRefreshDomain(oauth),
+          "X-Refresh-Token": refreshToken,
+          "X-Auth-Refresh-Source": "plugin",
+          "X-Product": "SaaS"
+        },
+        body: "{}"
+      }, proxyOptions);
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      log?.error?.("TOKEN_REFRESH", "Failed to refresh CodeBuddy token", {
-        status: response.status,
-        error: safeRefreshError(errorText)
+      if (!response.ok) {
+        const errorText = await response.text();
+        const failure = classifyOAuthRefreshError(errorText, response.status);
+        if (failure.permanent || response.status === 401 || response.status === 403) {
+          log?.error?.("TOKEN_REFRESH", "CodeBuddy refresh token rejected. Re-auth required.", {
+            status: response.status,
+            code: safeRefreshError(failure.code)
+          });
+          return { error: "unrecoverable_refresh_error", code: failure.code };
+        }
+
+        log?.error?.("TOKEN_REFRESH", "Failed to refresh CodeBuddy token", {
+          status: response.status,
+          error: safeRefreshError(errorText),
+          code: safeRefreshError(failure.code)
+        });
+        return null;
+      }
+
+      const payload = await response.json();
+      // The official envelope is { code: 0, data: <token> }, but some gateways
+      // answer with the token object at top level and/or without `code`. Only a
+      // non-empty accessToken is required (official `hasUsableAuthToken`).
+      const envelope = payload?.data;
+      const token = envelope !== null && isObject(envelope) && !Array.isArray(envelope) ? envelope : payload;
+      const accessToken = isString(token?.accessToken) ? token.accessToken.trim() : "";
+      if (!accessToken) {
+        log?.error?.("TOKEN_REFRESH", "CodeBuddy token refresh returned no access token", {
+          code: payload?.code,
+          msg: safeRefreshError(payload?.msg)
+        });
+        return null;
+      }
+
+      const replacementRefreshToken = isString(token?.refreshToken) ? token.refreshToken.trim() : "";
+      const result = {
+        accessToken,
+        refreshToken: replacementRefreshToken || refreshToken
+      };
+      const expiresIn = codebuddyExpiresIn(token?.expiresIn);
+      const expiresAt = expiresIn === null ? codebuddyExpiresAt(token?.expiresAt) : null;
+      if (expiresIn !== null) result.expiresIn = expiresIn;
+      else if (expiresAt !== null) result.expiresAt = expiresAt;
+
+      log?.info?.("TOKEN_REFRESH", "Successfully refreshed CodeBuddy token", {
+        hasNewAccessToken: true,
+        hasNewRefreshToken: !!replacementRefreshToken,
+        expiresIn: result.expiresIn,
+        expiresAt: result.expiresAt
       });
+
+      return result;
+    } catch (error) {
+      log?.error?.("TOKEN_REFRESH", `Network error refreshing CodeBuddy token: ${safeRefreshError(error)}`);
       return null;
     }
-
-    const data = await response.json();
-    if (data.code !== 0 || !data.data?.accessToken) {
-      log?.error?.("TOKEN_REFRESH", "CodeBuddy token refresh returned no token", {
-        code: data.code,
-        msg: safeRefreshError(data.msg)
-      });
-      return null;
-    }
-
-    log?.info?.("TOKEN_REFRESH", "Successfully refreshed CodeBuddy token", {
-      hasNewAccessToken: !!data.data.accessToken,
-      hasNewRefreshToken: !!data.data.refreshToken,
-      expiresIn: data.data.expiresIn
-    });
-
-    return {
-      accessToken: data.data.accessToken,
-      refreshToken: data.data.refreshToken || refreshToken,
-      expiresIn: data.data.expiresIn
-    };
   }, log, proxyOptions);
 }

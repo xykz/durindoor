@@ -55,6 +55,8 @@
 - `provider(kimi)!`: align Kimi Code with the documented [`k3`, `k3-256k`, and K2.7 Code model IDs](https://www.kimi.com/code/docs/en/kimi-code/models.html), [protocol endpoints](https://www.kimi.com/code/docs/en/third-party-tools/claude-code.html), and [quota/error semantics](https://www.kimi.com/code/docs/en/kimi-code/membership.html). This is a clean cutover for first-party `kimi`/`kimi-coding` provider catalogs: their legacy `kimi-k*`/`moonshotai/*` IDs, the `.cn` fallback, and `?beta=true` are removed; generic Kimi metadata for third-party registries remains, and the documented inbound `k3[1m]` spelling remains.
 - Default/LLM combos in `/v1/models` now advertise member-safe `context_length` and `max_completion_tokens` limits while preserving nested capabilities; web-search and web-fetch combos remain field-free. Ports decolua/9router#3529. Closes #596.
 
+- CodeBuddy CN token refresh now mirrors the official CLI request (refresh token in `X-Refresh-Token`, `X-Auth-Refresh-Source: plugin`, `X-Domain` derived from the configured endpoint, empty `{}` body, no `Authorization`), reads token fields from the `data` envelope, and maps `401`/`403` dead grants to unrecoverable refresh errors so the connection is flagged re-auth required instead of failing every request with a bare `401`.
+
 ## Security
 
 - Public tunnel subdomains now use unbiased OS CSPRNG sampling instead of predictable `Math.random()` state, and Cloudflare tunnel startup accepts either the preferred relay URL or direct URL as health proof while still failing when both are unavailable. Ports decolua/9router#3522 and #3519. Closes #605.
