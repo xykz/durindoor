@@ -26,6 +26,7 @@ For users getting their first request through the gateway.
 - [Provider Connections](providers/subscription.md): OAuth, API key, cookie, and account-based providers.
 - [Provider Nodes and Custom Providers](providers/cheap.md): OpenAI-compatible nodes, Anthropic-compatible nodes, custom embeddings, and provider aliases.
 - [Free and Local Providers](providers/free.md): no-auth, local, browser-cookie, and local-device providers.
+- [CodeBuddy CN](providers/codebuddy-cn.md): Tencent CodeBuddy via OAuth or API key, model limits, and the official-CLI alignment contract.
 - [Claude Code](integration/claude-code.md)
 - [Ollama + Claude Code](integration/ollama-claude.md)
 - [OpenAI Codex](integration/codex.md)
