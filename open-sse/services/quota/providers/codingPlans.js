@@ -23,6 +23,7 @@ import {
 "../providerHelpers.js";
 import { isBoolean, isString } from "../../../../src/shared/utils/typeChecks.js";
 import { KIMI_PLANS } from "../../../providers/shared.js";
+import { codebuddyUserAgent } from "../../../providers/codebuddyCli.js";
 
 function safePlan(value, fallback = null) {
   return isString(value) && value.trim() ? value.trim() : fallback;
@@ -481,11 +482,13 @@ export async function fetchCodeBuddyQuota(context) {
       Authorization: `Bearer ${token}`,
       Accept: "application/json",
       "Content-Type": "application/json",
-      "User-Agent": "CLI/2.108.1 CodeBuddy/2.108.1",
+      "User-Agent": codebuddyUserAgent(),
       "X-Product": "SaaS",
       "X-IDE-Type": "CLI",
       "X-IDE-Name": "CLI",
       "x-requested-with": "XMLHttpRequest",
+      // The billing gateway (unlike the chat gateway) is probed with this marker;
+      // keep it here even though the chat transport no longer sends it.
       "x-codebuddy-request": "1"
     },
     body: "{}"

@@ -57,6 +57,9 @@ export async function getCodeBuddyCnUsage(accessToken, apiKey, providerSpecificD
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
         Accept: "application/json",
+        // The chat transport stopped sending this (the official CLI only uses it on
+        // its local daemon endpoints), but the billing gateway kept it historically.
+        "x-codebuddy-request": "1",
       },
       body: "{}",
     }, proxyOptions);
