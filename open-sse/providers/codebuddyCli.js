@@ -221,6 +221,93 @@ export function codebuddyStainlessArch(arch) {
 }
 
 /**
+ * Decode a JWT payload without verifying the signature.
+ *
+ * The token has already been validated by the upstream — DurinDoor is reading
+ * claims to *describe* the caller, not to authenticate them, exactly as the CLI
+ * does with its own stored token. A malformed token yields null rather than
+ * throwing, so a caller can safely treat identity as unknown.
+ *
+ * @param {string} token - Raw bearer token, with or without the `Bearer ` prefix.
+ * @returns {object|null} Decoded claims, or null when the token is unreadable.
+ */
+function decodeJwtClaims(token) {
+  if (!isString(token) || !token) return null;
+  const raw = token.startsWith("Bearer ") ? token.slice(7) : token;
+  const parts = raw.split(".");
+  if (parts.length < 2) return null;
+  try {
+    const payload = Buffer.from(parts[1], "base64url").toString("utf8");
+    const claims = JSON.parse(payload);
+    return claims && typeof claims === "object" ? claims : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Identity headers the CLI derives from its authenticated session.
+ *
+ * A captured 2.177.0 request made with a real account token carried
+ * `X-User-Id: <token sub>` and `X-Domain: <iss host>`; the same request made
+ * without a token carried neither, and `X-User-Id` degraded to `anonymous`.
+ * That establishes both headers as token-derived rather than constants.
+ *
+ * `enterpriseId` follows the CLI's own `tryExtractUserIDFromJWTToken()`: only an
+ * issuer whose last path segment starts with `sso-` denotes an enterprise
+ * account, and the id is that segment with the prefix stripped. A regular
+ * consumer account (`.../realms/copilot`) has no enterprise id.
+ *
+ * `X-Enterprise-Id` / `X-Tenant-Id` / `X-Private-Data` are emitted only when an
+ * enterprise id exists, matching a capture of the enterprise branch, where
+ * `X-Private-Data` flipped from `false` to `true` because model optimization is
+ * force-disabled for enterprise accounts.
+ *
+ * `X-Userinfo`, `X-Auth-Method` and `X-Id-Source` are NOT produced: the CLI
+ * populates them from login-flow metadata (auth method, id source) that a stored
+ * OAuth token does not carry, and both captures confirmed their absence.
+ *
+ * @param {string} accessToken - The account's access token.
+ * @param {string} [apiKey] - The account's API key, used when the token is opaque.
+ * @returns {object} Header name/value pairs; empty when there is no identity.
+ */
+export function codebuddyIdentityHeaders(accessToken, apiKey) {
+  const claims = decodeJwtClaims(accessToken);
+  if (!claims) {
+    // The CLI's API-key storage has no claims to read and falls back to a
+    // pseudonymous id built from the key's last eight characters. A captured
+    // API-key run carried exactly that, and no X-Domain, so this branch stays
+    // narrow on purpose: an id, nothing else.
+    return isString(apiKey) && apiKey ?
+      { "X-User-Id": `anonymous_${apiKey.slice(-8)}` } :
+      {};
+  }
+
+  const headers = {};
+  if (isString(claims.sub) && claims.sub) headers["X-User-Id"] = claims.sub;
+
+  if (isString(claims.iss) && claims.iss) {
+    try {
+      headers["X-Domain"] = new URL(claims.iss).hostname;
+    } catch {
+      // A non-URL issuer simply yields no domain, as in the CLI's own fallback.
+    }
+    const lastSegment = claims.iss.split("/").pop() || "";
+    if (lastSegment.startsWith("sso-")) {
+      const enterpriseId = lastSegment.slice(4);
+      if (enterpriseId) {
+        headers["X-Enterprise-Id"] = enterpriseId;
+        headers["X-Tenant-Id"] = enterpriseId;
+        // resolveModelOptimizationEnabled() returns false for enterprise
+        // accounts, and the private-data flag is that value inverted.
+        headers["X-Private-Data"] = "true";
+      }
+    }
+  }
+  return headers;
+}
+
+/**
  * Whether CLI-alignment headers and body fields are applied.
  *
  * `CODEBUDDY_CLI_ALIGNMENT=off` is the one-line rollback if a future upstream

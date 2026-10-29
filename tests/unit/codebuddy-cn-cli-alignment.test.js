@@ -14,6 +14,7 @@ import {
   codebuddyCacheRetention,
   codebuddyCliVersion,
   codebuddyConversationId,
+  codebuddyIdentityHeaders,
   codebuddyRequestId,
   codebuddyUserAgent,
 } from "../../open-sse/providers/codebuddyCli.js";
@@ -46,6 +47,13 @@ const CONTEXT = { sessionId: "session-abc", catalogModel: "glm-5.2", modelCapabi
 
 function plainBody() {
   return { messages: [{ role: "user", content: "hi" }] };
+}
+
+// Builds an unsigned JWT. The CLI decodes these claims without verifying the
+// signature, so a synthetic payload reproduces what a real login produces.
+function jwt(claims) {
+  const encode = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  return `${encode({ alg: "RS256", typ: "JWT" })}.${encode(claims)}.signature`;
 }
 
 describe("CodeBuddy CN CLI fingerprint source", () => {
@@ -210,6 +218,84 @@ describe("CodeBuddyExecutor mirrors CLI conversation headers", () => {
     const headers = makeExec().buildHeaders(CREDENTIALS, true, CONTEXT);
     const keys = Object.keys(headers).filter((key) => key.toLowerCase() === "x-conversation-id");
     expect(keys).toHaveLength(1);
+  });
+});
+
+describe("CodeBuddy CN identity headers derive from the account token", () => {
+  // A captured 2.177.0 request made with a real account token carried these two
+  // headers derived from the token claims; the same request without a token
+  // carried neither and degraded X-User-Id to "anonymous".
+  const CONSUMER_TOKEN = jwt({
+    sub: "2a2c9009-18cc-44bb-b8d5-2cdeacefea12",
+    preferred_username: "13360580715",
+    iss: "https://www.codebuddy.cn/auth/realms/copilot",
+    enterprise_id: "",
+  });
+  const ENTERPRISE_TOKEN = jwt({
+    sub: "9f1c2d3e-4a5b-6c7d-8e9f-001122334455",
+    iss: "https://www.codebuddy.cn/auth/realms/sso-987654321",
+  });
+
+  it("derives X-User-Id from the token subject and X-Domain from the issuer host", () => {
+    expect(codebuddyIdentityHeaders(CONSUMER_TOKEN)).toEqual({
+      "X-User-Id": "2a2c9009-18cc-44bb-b8d5-2cdeacefea12",
+      "X-Domain": "www.codebuddy.cn",
+    });
+  });
+
+  it("treats an sso- issuer as an enterprise account and flips the private-data flag", () => {
+    expect(codebuddyIdentityHeaders(ENTERPRISE_TOKEN)).toEqual({
+      "X-User-Id": "9f1c2d3e-4a5b-6c7d-8e9f-001122334455",
+      "X-Domain": "www.codebuddy.cn",
+      "X-Enterprise-Id": "987654321",
+      "X-Tenant-Id": "987654321",
+      "X-Private-Data": "true",
+    });
+  });
+
+  it("emits nothing for an unreadable token rather than throwing", () => {
+    expect(codebuddyIdentityHeaders("not-a-jwt")).toEqual({});
+    expect(codebuddyIdentityHeaders(undefined)).toEqual({});
+    expect(codebuddyIdentityHeaders("")).toEqual({});
+  });
+
+  it("never emits the identity headers a stored OAuth token cannot populate", () => {
+    const headers = codebuddyIdentityHeaders(ENTERPRISE_TOKEN);
+    for (const key of ["X-Userinfo", "X-Auth-Method", "X-Id-Source", "X-Department-Info"]) {
+      expect(headers[key]).toBeUndefined();
+    }
+  });
+
+  it("falls back to the CLI's pseudonymous id for an opaque API key", () => {
+    // A captured API-key run carried X-User-Id: anonymous_<last 8> and no X-Domain.
+    expect(codebuddyIdentityHeaders(undefined, "sk-test-apikey-12345678")).toEqual({
+      "X-User-Id": "anonymous_12345678",
+    });
+    const headers = makeExec().buildHeaders(
+      { apiKey: "sk-test-apikey-12345678", connectionId: "conn-abc" },
+      true,
+      CONTEXT
+    );
+    expect(headers["X-User-Id"]).toBe("anonymous_12345678");
+    expect(headers["X-Domain"]).toBeUndefined();
+  });
+
+  it("sends them on the wire for a consumer account", () => {
+    const headers = makeExec().buildHeaders(
+      { accessToken: CONSUMER_TOKEN, connectionId: "conn-abc" },
+      true,
+      CONTEXT
+    );
+    expect(headers["X-User-Id"]).toBe("2a2c9009-18cc-44bb-b8d5-2cdeacefea12");
+    expect(headers["X-Domain"]).toBe("www.codebuddy.cn");
+    expect(headers["X-Private-Data"]).toBe("false");
+    expect(headers["X-Enterprise-Id"]).toBeUndefined();
+  });
+
+  it("keeps the non-enterprise private-data default when the token is opaque", () => {
+    const headers = makeExec().buildHeaders(CREDENTIALS, true, CONTEXT);
+    expect(headers["X-Private-Data"]).toBe("false");
+    expect(headers["X-User-Id"]).toBeUndefined();
   });
 });
 

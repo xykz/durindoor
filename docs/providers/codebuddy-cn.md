@@ -79,7 +79,11 @@ shape the gateway sees most often. The single source is
 | `X-Agent-Runtime` | `other` | CLI default with no runtime metadata |
 | `X-Agent-Type` | `main` | CLI default with no team/parent context |
 | `X-Agent-Purpose` | `conversation` | CLI `AgentPurpose.Conversation` default |
-| `X-Private-Data` | `false` | CLI `resolveModelOptimizationEnabled()` for a non-enterprise account |
+| `X-Private-Data` | `false` for a consumer account, `true` for an enterprise one | CLI `resolveModelOptimizationEnabled()`, disabled for enterprise accounts |
+| `X-User-Id` | token `sub` | CLI `runIdentityHeaders()`; see [Identity headers](#identity-headers) |
+| `X-Domain` | `iss` host, e.g. `www.codebuddy.cn` | CLI `tryExtractUserIDFromJWTToken()` |
+| `X-Enterprise-Id` / `X-Tenant-Id` | only for an `sso-` issuer | CLI `enterpriseHeaders()`; consumer accounts carry neither |
+| `X-User-Id` (API-key accounts) | `anonymous_<last 8 of the key>` | CLI API-key storage's `getUserId()` |
 | `x-codebuddy-request` | `1` | Present on a captured CLI chat request, despite appearing only at daemon call sites in the bundle |
 | `x-requested-with` | `XMLHttpRequest` | Same — present on a captured chat request |
 | `Accept` | `application/json` | OpenAI SDK `buildHeaders()`; the CLI streams via the body, not this header |
@@ -127,11 +131,39 @@ per-prompt id doubles as the root id.
 
 | Header / field | Why |
 | --- | --- |
-| `X-Userinfo`, `X-User-Id`, `X-Enterprise-Id`, `X-Auth-Method`, `X-Id-Source` | These are authenticated identity assertions derived from the CLI's own login session. DurinDoor does not store those fields, and synthesizing them would mean presenting a fabricated identity to the upstream. A capture of an unauthenticated CLI shows `X-User-Id: anonymous`, which confirms the value comes from the login state rather than being a constant. |
-| `X-Domain`, `X-Tenant-Id`, `X-Department-Info` | The CLI emits these only under `CODEBUDDY_INTERNET_ENVIRONMENT=ioa` (internal deployments). Public SaaS traffic does not carry them. |
+| `X-Userinfo`, `X-Auth-Method`, `X-Id-Source` | The CLI builds these from login-flow metadata (`auth.method`, `account.idSource`) that a stored OAuth token does not carry. Two captures — one consumer, one enterprise — both lacked all three. |
+| `X-Department-Info` | Requires the account's department name, which no token claim carries. Absent from both captures. |
 | `X-Skip-Auth-Interceptor`, `traceparent`, `b3`, `X-B3-*`, `X-Trace-ID`, `baggage` | Telemetry and gateway plumbing with no functional effect on chat. The CLI mints them from an OpenTelemetry span; there is nothing to mirror without a trace context. |
 | `prompt_cache_retention`, `store` | Belong to the CLI's second request path (the OpenAI Agents SDK one). On `chat/completions` the CLI uses `cache_retention` instead and leaves these unset. |
 | System-prompt rewriting | See below — DurinDoor forwards third-party agent prompts by design. |
+
+### Identity headers
+
+`X-User-Id`, `X-Domain`, `X-Enterprise-Id`, `X-Tenant-Id` and `X-Private-Data` **are**
+mirrored, derived from the account's access token the same way the CLI derives them
+from its own session:
+
+| Header | Source | Consumer account | Enterprise account |
+| --- | --- | --- | --- |
+| `X-User-Id` | token `sub` | present | present |
+| `X-Domain` | `iss` host | `www.codebuddy.cn` | `www.codebuddy.cn` |
+| `X-Enterprise-Id`, `X-Tenant-Id` | `iss` last segment when it starts with `sso-` | absent | present, prefix stripped |
+| `X-Private-Data` | `resolveModelOptimizationEnabled()` — off for enterprise | `false` | `true` |
+
+This was established by capturing the same CLI build twice: once with a real account
+token and once without. The unauthenticated run carried `X-User-Id: anonymous` and no
+`X-Domain`; the authenticated run carried the token's `sub` and the issuer host. A
+synthetic `sso-` issuer reproduced the enterprise branch, where `X-Private-Data`
+flipped to `true` and the tenant/enterprise ids appeared.
+
+A third capture, run with `CODEBUDDY_API_KEY` instead of a token, carried
+`X-User-Id: anonymous_12345678` — the key's last eight characters behind the CLI's
+`anonymous_` prefix — and still no `X-Domain`. That is the CLI's API-key storage path,
+where there are no claims to read.
+
+An unreadable token with no API key emits none of these and keeps the non-enterprise
+`X-Private-Data: false` default, so an unidentified caller degrades to the
+unauthenticated shape rather than to a wrong identity.
 
 ### Deliberate divergences in behavior
 

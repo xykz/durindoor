@@ -9,6 +9,7 @@ import {
   codebuddyConversationId,
   codebuddyConversationRequestId,
   codebuddyHarnessMetadata,
+  codebuddyIdentityHeaders,
   codebuddyRequestId,
   codebuddyStainlessArch,
   codebuddyStainlessOs,
@@ -181,7 +182,11 @@ export class CodeBuddyExecutor extends DefaultExecutor {
     headers["X-Agent-Runtime"] = "other";
     headers["X-Agent-Type"] = "main";
     headers["X-Agent-Purpose"] = "conversation";
+    // A non-enterprise account resolves model optimization on, so the CLI sends
+    // "false" here; an enterprise account flips it to "true". Identity headers are
+    // derived from the account token and override this default when they can.
     headers["X-Private-Data"] = "false";
+    Object.assign(headers, codebuddyIdentityHeaders(credentials?.accessToken, credentials?.apiKey));
 
     // The CLI's chat client is the bundled `openai` SDK, whose buildHeaders()
     // stamps these on every request and whose adapter never removes them. There is
