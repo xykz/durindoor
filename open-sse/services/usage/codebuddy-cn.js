@@ -57,6 +57,9 @@ export async function getCodeBuddyCnUsage(accessToken, apiKey, providerSpecificD
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
         Accept: "application/json",
+        // x-codebuddy-request and x-requested-with already come in through the
+        // registry headers above, which the chat transport also sends. The CLI's
+        // billing probe and chat path therefore agree on them.
       },
       body: "{}",
     }, proxyOptions);

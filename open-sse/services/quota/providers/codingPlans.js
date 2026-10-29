@@ -23,6 +23,7 @@ import {
 "../providerHelpers.js";
 import { isBoolean, isString } from "../../../../src/shared/utils/typeChecks.js";
 import { KIMI_PLANS } from "../../../providers/shared.js";
+import { codebuddyUserAgent } from "../../../providers/codebuddyCli.js";
 
 function safePlan(value, fallback = null) {
   return isString(value) && value.trim() ? value.trim() : fallback;
@@ -481,11 +482,14 @@ export async function fetchCodeBuddyQuota(context) {
       Authorization: `Bearer ${token}`,
       Accept: "application/json",
       "Content-Type": "application/json",
-      "User-Agent": "CLI/2.108.1 CodeBuddy/2.108.1",
+      "User-Agent": codebuddyUserAgent(),
       "X-Product": "SaaS",
       "X-IDE-Type": "CLI",
       "X-IDE-Name": "CLI",
       "x-requested-with": "XMLHttpRequest",
+      // The billing gateway is probed with this marker. The chat transport sends it
+      // too now (a captured CLI request carries it), but this call site keeps its
+      // own explicit list rather than inheriting the chat header set.
       "x-codebuddy-request": "1"
     },
     body: "{}"

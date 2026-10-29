@@ -1,3 +1,8 @@
+import {
+  CODEBUDDY_CLI_VERSION,
+  codebuddyUserAgent,
+} from "../codebuddyCli.js";
+
 export default {
   id: "codebuddy-cn",
   // Short model prefix (cbcn/glm-5.2). "cbcn" = CodeBuddy CN; reserve "cbai"
@@ -21,17 +26,26 @@ export default {
   transport: {
     baseUrl: "https://copilot.tencent.com/v2/chat/completions",
     forceStream: true,
+    // Pinned to the @tencent-ai/codebuddy-code release this provider mirrors.
+    // Single source: open-sse/providers/codebuddyCli.js.
+    cliVersion: CODEBUDDY_CLI_VERSION,
     // CodeBuddy is a unified OpenAI-compatible gateway: every model (GLM, Kimi,
     // MiniMax, DeepSeek, Hunyuan) takes reasoning via OpenAI-style reasoning_effort,
     // not its vendor-native thinking shape. Force the openai thinking format.
     thinkingFormat: "openai",
     headers: {
-      "User-Agent": "CLI/2.108.1 CodeBuddy/2.108.1",
+      // The official CLI builds this from its own product version
+      // (`CLI/<v> CodeBuddy/<v>`). Derived here so a version bump is one edit.
+      "User-Agent": codebuddyUserAgent(),
       "X-Product": "SaaS",
       "X-IDE-Type": "CLI",
       "X-IDE-Name": "CLI",
-      "x-requested-with": "XMLHttpRequest",
+      // Both of these look like daemon-only headers in the CLI source, but every
+      // captured chat request carries them, so they stay. A source read that only
+      // saw the daemon call sites removed them once; the live capture is
+      // authoritative.
       "x-codebuddy-request": "1",
+      "x-requested-with": "XMLHttpRequest",
     },
     auth: {
       combined: true,
@@ -66,7 +80,8 @@ export default {
     stateUrl: "https://copilot.tencent.com/v2/plugin/auth/state",
     tokenUrl: "https://copilot.tencent.com/v2/plugin/auth/token",
     refreshUrl: "https://copilot.tencent.com/v2/plugin/auth/token/refresh",
-    userAgent: "CLI/2.63.2 CodeBuddy/2.63.2",
+    // Same fingerprint as the chat transport: one CLI version, one UA string.
+    userAgent: codebuddyUserAgent(),
     platform: "CLI",
     pollInterval: 5000,
   },

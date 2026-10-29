@@ -131,6 +131,18 @@ MITM mode is optional and requires explicit local setup.
 | `MITM_SERVER_PATH` | auto-detected | Path to the MITM server implementation copied into runtime storage. |
 | `DEBUG_MITM` | unset | Enables verbose MITM handler debugging. |
 
+## CodeBuddy CN CLI Alignment
+
+`codebuddy-cn` mirrors the official `codebuddy` CLI (`@tencent-ai/codebuddy-code`)
+request fingerprint. See [CodeBuddy CN](../providers/codebuddy-cn.md) for the
+alignment contract.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `CODEBUDDY_CLI_VERSION` | the version in `open-sse/providers/codebuddyCli.js` (currently `2.138.0`) | CLI release the `User-Agent` and `X-IDE-Version` are derived from. Malformed values fall back to the pinned version. The pinned release predates the UUIDv7 cutover at 2.146.0, so raising this past that point makes the emitted ids disagree with the advertised version. |
+| `CODEBUDDY_CLI_ALIGNMENT` | unset (enabled) | `off` stops sending every mirrored header — identity, conversation and the seven trace headers — reverting to the pre-alignment request shape. |
+| `CODEBUDDY_SYSTEM_PROMPT_MAX_LEN` | `2000` | System prompts longer than this are replaced by a neutral prompt. `0` disables only the length rule. |
+
 ## Translator and Provider Debugging
 
 | Variable | Default | Description |
