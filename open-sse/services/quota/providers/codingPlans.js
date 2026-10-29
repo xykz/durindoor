@@ -487,8 +487,9 @@ export async function fetchCodeBuddyQuota(context) {
       "X-IDE-Type": "CLI",
       "X-IDE-Name": "CLI",
       "x-requested-with": "XMLHttpRequest",
-      // The billing gateway (unlike the chat gateway) is probed with this marker;
-      // keep it here even though the chat transport no longer sends it.
+      // The billing gateway is probed with this marker. The chat transport sends it
+      // too now (a captured CLI request carries it), but this call site keeps its
+      // own explicit list rather than inheriting the chat header set.
       "x-codebuddy-request": "1"
     },
     body: "{}"

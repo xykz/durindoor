@@ -9,19 +9,29 @@
  * (chat transport, OAuth flow, quota fetcher). Deriving all of them here means
  * one bump updates the whole surface.
  *
- * Observed against @tencent-ai/codebuddy-code 2.172.1 (product.json dated
- * 2026-10-21). See docs/providers/codebuddy-cn.md for the alignment contract and
- * for the headers DurinDoor deliberately does NOT mirror.
+ * Observed against @tencent-ai/codebuddy-code 2.177.0 (product.json dated
+ * 2026-10-26), which is the release with the highest npm download volume and
+ * therefore the shape the gateway sees most often. See
+ * docs/providers/codebuddy-cn.md for the alignment contract, the version
+ * history, and the headers DurinDoor deliberately does NOT mirror.
  */
 
-import { createHash, randomUUID } from "crypto";
+import { createHash, randomBytes } from "crypto";
 import { isString } from "../../src/shared/utils/typeChecks.js";
 
 /** CLI release this fingerprint mirrors. Bump when the CLI's UA changes. */
-export const CODEBUDDY_CLI_VERSION = "2.172.1";
+export const CODEBUDDY_CLI_VERSION = "2.177.0";
+
+/**
+ * Version of the `openai` npm package the CLI bundles. Surfaces as
+ * `X-Stainless-Package-Version`; the value is a literal in the CLI's SDK copy
+ * (`X-Stainless-Package-Version: "6.25.0"`), not derived from its config.
+ */
+export const CODEBUDDY_SDK_PACKAGE_VERSION = "6.25.0";
 
 const VERSION_RE = /^\d+\.\d+\.\d+$/;
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Dashed UUIDv7, the shape the CLI uses for its session (X-Conversation-ID). */
+const UUID_V7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 /**
  * Effective CLI version. `CODEBUDDY_CLI_VERSION` overrides the pinned value so an
@@ -37,7 +47,7 @@ export function codebuddyCliVersion() {
 
 /**
  * Official CLI builds this as `buildUserAgent()`: platform/version + product/version
- * joined by a space. Result: `CLI/2.172.1 CodeBuddy/2.172.1`.
+ * joined by a space. Result: `CLI/2.177.0 CodeBuddy/2.177.0`.
  *
  * @param {string} [version] - Explicit version; defaults to {@link codebuddyCliVersion}.
  * @returns {string} The User-Agent the CLI sends on chat requests.
@@ -62,36 +72,152 @@ export function codebuddyCacheRetention() {
   return "long";
 }
 
+// --- UUIDv7 assembly -------------------------------------------------------
+// The CLI mints both its session id and its message/request ids with `uuidv7()`
+// (a 48-bit millisecond timestamp, then version `7`, then 74 random bits). The
+// gateway validates that nibble pattern on conversation request ids, so UUIDv4
+// values — what DurinDoor used to send — do not match the CLI's shape.
+
 /**
- * Per-request identifier in the CLI's shape: a UUID with the dashes stripped
- * (32 lowercase hex characters). Used for X-Request-ID and the conversation
- * request/message ids.
+ * Stamps the UUIDv7 version and RFC-4122 variant nibbles onto 32 hex chars.
  *
- * @returns {string} 32 hex characters.
+ * @param {string} hex - 32 lowercase hex characters (timestamp + randomness).
+ * @returns {string} 32 lowercase hex characters in UUIDv7 shape.
+ */
+function asUuidV7Hex(hex) {
+  const chars = hex.slice(0, 32).split("");
+  chars[12] = "7";
+  const variant = ((parseInt(chars[16], 16) || 0) & 0x3) | 0x8;
+  chars[16] = variant.toString(16);
+  return chars.join("");
+}
+
+/**
+ * Formats 32 hex characters as a dashed UUID.
+ *
+ * @param {string} hex - 32 lowercase hex characters.
+ * @returns {string} `8-4-4-4-12` layout.
+ */
+function dashUuid(hex) {
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+/**
+ * Current millisecond clock as the 12 hex characters a UUIDv7 starts with.
+ *
+ * @returns {string} 12 lowercase hex characters.
+ */
+function uuidV7Timestamp() {
+  return Date.now().toString(16).padStart(12, "0").slice(-12);
+}
+
+/**
+ * Per-request identifier in the CLI's shape: a UUIDv7 with the dashes stripped
+ * (32 lowercase hex characters, version nibble `7`). Used for both X-Request-ID
+ * and X-Conversation-Message-ID, which the CLI always sets to the same value.
+ *
+ * @returns {string} 32 hex characters in UUIDv7 shape (version nibble `7`).
  */
 export function codebuddyRequestId() {
-  return randomUUID().replace(/-/g, "").toLowerCase();
+  const random = randomBytes(10).toString("hex");
+  return asUuidV7Hex(`${uuidV7Timestamp()}${random}`);
 }
 
 /**
  * Conversation identifier for X-Conversation-ID.
  *
- * The CLI sends its session UUID verbatim. DurinDoor's session ids come from
- * `resolveSessionId` and are either a client-supplied id (any shape) or a
- * generated `uuid + timestamp` string, so anything that is not already a UUID
- * is hashed into a stable UUID-v4-shaped value. The same seed therefore always
- * yields the same conversation id, and a different seed a different one.
+ * The CLI sends its session UUIDv7 verbatim, so a client-supplied UUIDv7 is
+ * passed through unchanged. Anything else — a non-UUID session id, or a UUID of
+ * a different version — is hashed into a stable UUIDv7-shaped value, because the
+ * gateway expects the CLI's shape and DurinDoor's session ids come from
+ * `resolveSessionId` (client-supplied id of any shape, or a generated
+ * `uuid + timestamp` string). The same seed therefore always yields the same
+ * conversation id, and a different seed a different one.
  *
  * @param {string} [seed] - Session or connection identifier.
- * @returns {string} A UUID-shaped conversation id.
+ * @returns {string} A dashed UUIDv7-shaped conversation id.
  */
 export function codebuddyConversationId(seed) {
-  const value = isString(seed) ? seed.trim() : "";
-  if (value && UUID_RE.test(value)) return value.toLowerCase();
+  const value = isString(seed) ? seed.trim().toLowerCase() : "";
+  if (value && UUID_V7_RE.test(value)) return value;
   const digest = createHash("sha256").update(`codebuddy-cn:${value || "anonymous"}`).digest("hex");
-  // Force version 4 / RFC-4122 variant nibbles so the result is a valid UUID.
-  const variant = ((parseInt(digest[16], 16) & 0x3) | 0x8).toString(16);
-  return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-4${digest.slice(13, 16)}-${variant}${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
+  return dashUuid(asUuidV7Hex(digest));
+}
+
+/**
+ * Conversation request id for X-Conversation-Request-ID and X-Root-Request-ID.
+ *
+ * The CLI generates one per prompt (`generateConversationRequestId()`), sets it on
+ * the session before the model call, and stamps the same value on both headers —
+ * verified against a live 2.177.0 run, where the two headers were byte-identical.
+ * It is a UUIDv7 with the dashes stripped, not the message id: a captured request
+ * carried `x-conversation-request-id: 01a1862111327a898de142708d9f4f5a` alongside
+ * `x-request-id: 01a1862112127fae94693612b8643bdd`.
+ *
+ * @returns {string} 32 hex characters in UUIDv7 shape.
+ */
+export function codebuddyConversationRequestId() {
+  return codebuddyRequestId();
+}
+
+/**
+ * `harnessMetadata` value for the `extra_vars` body field.
+ *
+ * The CLI stamps a JSON *string* here on every model call. A captured 2.177.0
+ * request carried exactly:
+ * `{"schemaVersion":1,"harnessVersion":"2.177.0","stepIndex":0,"contextWindowId":"01a18621-1213-7a39-97ad-580ba22bca96","agent":{"depth":0}}`
+ * DurinDoor has no turn/step pipeline, so `stepIndex` is always 0 and `depth` is
+ * always 0 (top-level agent, not a subagent). `contextWindowId` reuses the
+ * conversation id, which is per-session exactly as the CLI's context window is;
+ * the CLI mints it separately (the captured value differed from both the session
+ * id and the conversation request id) but nothing upstream was observed to
+ * correlate the two, so one id keeps the gateway's state simpler.
+ *
+ * @param {string} conversationId - Dashed conversation id.
+ * @returns {string} JSON-encoded harness metadata.
+ */
+export function codebuddyHarnessMetadata(conversationId) {
+  return JSON.stringify({
+    schemaVersion: 1,
+    harnessVersion: codebuddyCliVersion(),
+    stepIndex: 0,
+    contextWindowId: isString(conversationId) ? conversationId : "",
+    agent: { depth: 0 },
+  });
+}
+
+/**
+ * `X-Stainless-OS` value: the OpenAI SDK's `normalizePlatform()` mapping.
+ *
+ * @param {string} [platform] - Defaults to `process.platform`.
+ * @returns {string} SDK-normalized platform name.
+ */
+export function codebuddyStainlessOs(platform) {
+  const raw = isString(platform) && platform ? platform : process.platform;
+  const value = raw.toLowerCase();
+  if (value.includes("ios")) return "iOS";
+  if (value === "android") return "Android";
+  if (value === "darwin") return "MacOS";
+  if (value === "win32") return "Windows";
+  if (value === "freebsd") return "FreeBSD";
+  if (value === "openbsd") return "OpenBSD";
+  if (value === "linux") return "Linux";
+  return value ? `Other:${raw}` : "Unknown";
+}
+
+/**
+ * `X-Stainless-Arch` value: the OpenAI SDK's `normalizeArch()` mapping.
+ *
+ * @param {string} [arch] - Defaults to `process.arch`.
+ * @returns {string} SDK-normalized architecture name.
+ */
+export function codebuddyStainlessArch(arch) {
+  const raw = isString(arch) && arch ? arch : process.arch;
+  if (raw === "x32") return "x32";
+  if (raw === "x86_64" || raw === "x64") return "x64";
+  if (raw === "arm") return "arm";
+  if (raw === "aarch64" || raw === "arm64") return "arm64";
+  return raw ? `other:${raw}` : "unknown";
 }
 
 /**

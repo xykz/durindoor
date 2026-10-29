@@ -18,8 +18,8 @@ import {
   codebuddyUserAgent,
 } from "../../open-sse/providers/codebuddyCli.js";
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const REQUEST_ID_RE = /^[0-9a-f]{32}$/;
+const UUID_V7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const REQUEST_ID_RE = /^[0-9a-f]{12}7[0-9a-f]{3}[89ab][0-9a-f]{15}$/;
 const UA_RE = /^CLI\/(\d+\.\d+\.\d+) CodeBuddy\/(\d+\.\d+\.\d+)$/;
 
 const ENV_KEYS = [
@@ -80,18 +80,25 @@ describe("CodeBuddy CN CLI fingerprint source", () => {
     expect(codebuddyCacheRetention()).toBe("long");
   });
 
-  it("mints dash-stripped 32-hex request ids", () => {
+  it("mints dash-stripped UUIDv7 request ids", () => {
     const id = codebuddyRequestId();
     expect(id).toMatch(REQUEST_ID_RE);
     expect(codebuddyRequestId()).not.toBe(id);
   });
 
-  it("passes a UUID through and hashes any other seed into a stable UUID", () => {
-    const uuid = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
-    expect(codebuddyConversationId(uuid)).toBe(uuid);
+  it("passes a UUIDv7 session id through and reshapes anything else", () => {
+    // The CLI's own session id is a dashed UUIDv7; it is sent verbatim.
+    const v7 = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+    expect(codebuddyConversationId(v7)).toBe(v7);
+
+    // A UUIDv4 (what DurinDoor used to send) is not the CLI's shape, so it is
+    // re-shaped rather than passed through.
+    const v4 = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+    expect(codebuddyConversationId(v4)).toMatch(UUID_V7_RE);
+    expect(codebuddyConversationId(v4)).not.toBe(v4);
 
     const hashed = codebuddyConversationId("session-abc");
-    expect(hashed).toMatch(UUID_RE);
+    expect(hashed).toMatch(UUID_V7_RE);
     expect(codebuddyConversationId("session-abc")).toBe(hashed);
     expect(codebuddyConversationId("session-xyz")).not.toBe(hashed);
     expect(codebuddyConversationId()).toBe(codebuddyConversationId(""));
@@ -114,8 +121,11 @@ describe("CodeBuddy CN registry mirrors the CLI fingerprint", () => {
     expect(provider.cliVersion).toBe(CODEBUDDY_CLI_VERSION);
   });
 
-  it("does not send the daemon-only x-codebuddy-request header on chat", () => {
-    expect(provider.headers["x-codebuddy-request"]).toBeUndefined();
+  it("keeps the two headers a source read wrongly suggests are daemon-only", () => {
+    // Both appear only at daemon call sites when you read the bundle, but a
+    // captured 2.177.0 chat request carries them. The capture wins.
+    expect(provider.headers["x-codebuddy-request"]).toBe("1");
+    expect(provider.headers["x-requested-with"]).toBe("XMLHttpRequest");
   });
 
   it("keeps the CLI's product/IDE headers", () => {
@@ -129,15 +139,48 @@ describe("CodeBuddyExecutor mirrors CLI conversation headers", () => {
   it("stamps the CLI's per-request identity headers", () => {
     const headers = makeExec().buildHeaders(CREDENTIALS, true, CONTEXT);
 
-    expect(headers["X-Conversation-ID"]).toMatch(UUID_RE);
+    expect(headers["X-Conversation-ID"]).toMatch(UUID_V7_RE);
+    // A captured request carried the same value on both of these, and it differs
+    // from the message id: it is the per-prompt id, minted once per turn.
     expect(headers["X-Conversation-Request-ID"]).toMatch(REQUEST_ID_RE);
-    expect(headers["X-Conversation-Message-ID"]).toBe(headers["X-Conversation-Request-ID"]);
-    expect(headers["X-Request-ID"]).toBe(headers["X-Conversation-Request-ID"]);
+    expect(headers["X-Root-Request-ID"]).toBe(headers["X-Conversation-Request-ID"]);
+    expect(headers["X-Conversation-Message-ID"]).toMatch(REQUEST_ID_RE);
+    expect(headers["X-Request-ID"]).toBe(headers["X-Conversation-Message-ID"]);
+    expect(headers["X-Conversation-Request-ID"]).not.toBe(headers["X-Request-ID"]);
     expect(headers["X-Agent-Intent"]).toBe("craft");
     expect(headers["X-Agent-Runtime"]).toBe("other");
     expect(headers["X-Agent-Type"]).toBe("main");
+    expect(headers["X-Agent-Purpose"]).toBe("conversation");
+    expect(headers["X-Private-Data"]).toBe("false");
     expect(headers["X-IDE-Version"]).toBe(codebuddyCliVersion());
     expect(headers["User-Agent"]).toBe(codebuddyUserAgent());
+  });
+
+  it("mirrors the OpenAI SDK's Stainless headers and json Accept", () => {
+    const headers = makeExec().buildHeaders(CREDENTIALS, true, CONTEXT);
+
+    expect(headers["Accept"]).toBe("application/json");
+    expect(headers["X-Stainless-Lang"]).toBe("js");
+    expect(headers["X-Stainless-Package-Version"]).toBe("6.25.0");
+    expect(headers["X-Stainless-Runtime"]).toBe("node");
+    expect(headers["X-Stainless-Runtime-Version"]).toBe(process.version);
+    expect(headers["X-Stainless-Retry-Count"]).toBe("0");
+    // No X-Stainless-Timeout: a captured request has none, even though the SDK
+    // emits one when the client sets a timeout.
+    expect(headers["X-Stainless-Timeout"]).toBeUndefined();
+    expect(headers["X-Stainless-OS"]).toMatch(/^[A-Za-z]+$/);
+    expect(headers["X-Stainless-Arch"]).toMatch(/^[a-z0-9]+$/);
+  });
+
+  it("sends Accept: application/json even without a request context", () => {
+    // The CLI signals streaming through the body, not the Accept header, so the
+    // json Accept must not depend on the alignment headers being applied.
+    expect(makeExec().buildHeaders(CREDENTIALS, true, null)["Accept"]).toBe("application/json");
+  });
+
+  it("restores the streaming Accept when alignment is off", () => {
+    process.env.CODEBUDDY_CLI_ALIGNMENT = "off";
+    expect(makeExec().buildHeaders(CREDENTIALS, true, CONTEXT)["Accept"]).toBe("text/event-stream");
   });
 
   it("anchors X-Conversation-ID on the gateway session and keeps it stable", () => {
@@ -192,6 +235,78 @@ describe("CodeBuddyExecutor mirrors CLI cache_retention", () => {
     const out = makeExec().transformRequest("glm-5.2", plainBody(), false, CREDENTIALS, CONTEXT);
     expect(out.stream).toBe(true);
   });
+
+  it("restores stream_options when the caller asked for a non-stream request", () => {
+    // The superclass's `stream===false` branch drops stream_options before the
+    // forced `stream:true` lands, leaving a stream request that never reports
+    // usage. The CLI always pairs the two.
+    const out = makeExec().transformRequest("glm-5.2", plainBody(), false, CREDENTIALS, CONTEXT);
+    expect(out.stream).toBe(true);
+    expect(out.stream_options).toEqual({ include_usage: true });
+  });
+
+  it("does not clobber an explicit stream_options value", () => {
+    const body = { ...plainBody(), stream_options: { include_usage: false } };
+    const out = makeExec().transformRequest("glm-5.2", body, true, CREDENTIALS, CONTEXT);
+    expect(out.stream_options).toEqual({ include_usage: false });
+  });
+});
+
+describe("CodeBuddyExecutor mirrors the CLI's verbosity beside reasoning", () => {
+  it("sends text.verbosity: high when reasoning was requested", () => {
+    // The CLI's model-settings interceptor sets modelSettings.text.verbosity =
+    // "high" at the same moment it enables thinking.
+    const body = { ...plainBody(), reasoning_effort: "high" };
+    const out = makeExec().transformRequest("glm-5.2", body, true, CREDENTIALS, CONTEXT);
+    expect(out.reasoning_summary).toBe("auto");
+    expect(out.verbosity).toBe("high");
+  });
+
+  it("leaves verbosity unset on a plain request", () => {
+    const out = makeExec().transformRequest("glm-5.2", plainBody(), true, CREDENTIALS, CONTEXT);
+    expect(out.reasoning_summary).toBeUndefined();
+    expect(out.verbosity).toBeUndefined();
+  });
+
+  it("never overrides a client-supplied verbosity", () => {
+    const body = { ...plainBody(), reasoning_effort: "low", verbosity: "low" };
+    const out = makeExec().transformRequest("glm-5.2", body, true, CREDENTIALS, CONTEXT);
+    expect(out.verbosity).toBe("low");
+  });
+});
+
+describe("CodeBuddyExecutor mirrors the CLI's harness metadata", () => {
+  it("stamps extra_vars.harnessMetadata as the CLI's JSON string", () => {
+    const out = makeExec().transformRequest("glm-5.2", plainBody(), true, CREDENTIALS, CONTEXT);
+    const meta = JSON.parse(out.extra_vars.harnessMetadata);
+
+    expect(meta.schemaVersion).toBe(1);
+    expect(meta.harnessVersion).toBe(codebuddyCliVersion());
+    expect(meta.stepIndex).toBe(0);
+    expect(meta.agent).toEqual({ depth: 0 });
+    expect(meta.contextWindowId).toMatch(UUID_V7_RE);
+  });
+
+  it("anchors contextWindowId on the same conversation id the headers carry", () => {
+    const exec = makeExec();
+    const headers = exec.buildHeaders(CREDENTIALS, true, CONTEXT);
+    const out = exec.transformRequest("glm-5.2", plainBody(), true, CREDENTIALS, CONTEXT);
+
+    expect(JSON.parse(out.extra_vars.harnessMetadata).contextWindowId).toBe(
+      headers["X-Conversation-ID"]
+    );
+  });
+
+  it("tags the turn as user-initiated, as both captured requests did", () => {
+    const out = makeExec().transformRequest("glm-5.2", plainBody(), true, CREDENTIALS, CONTEXT);
+    expect(out.extra_vars.initiator).toBe("user");
+  });
+
+  it("never clobbers caller-supplied extra_vars", () => {
+    const body = { ...plainBody(), extra_vars: { initiator: "agent" } };
+    const out = makeExec().transformRequest("glm-5.2", body, true, CREDENTIALS, CONTEXT);
+    expect(out.extra_vars).toEqual({ initiator: "agent" });
+  });
 });
 
 describe("CodeBuddyExecutor CLI-alignment kill switch", () => {
@@ -209,12 +324,24 @@ describe("CodeBuddyExecutor CLI-alignment kill switch", () => {
       "X-Agent-Intent",
       "X-Agent-Runtime",
       "X-Agent-Type",
+      "X-Agent-Purpose",
+      "X-Private-Data",
+      "X-Root-Request-ID",
+      "X-Stainless-Lang",
+      "X-Stainless-Package-Version",
+      "X-Stainless-OS",
+      "X-Stainless-Arch",
+      "X-Stainless-Runtime",
+      "X-Stainless-Runtime-Version",
+      "X-Stainless-Retry-Count",
     ]) {
       expect(headers[key]).toBeUndefined();
     }
 
     const out = exec.transformRequest("glm-5.2", plainBody(), true, CREDENTIALS, CONTEXT);
     expect(out.cache_retention).toBeUndefined();
+    expect(out.verbosity).toBeUndefined();
+    expect(out.extra_vars).toBeUndefined();
   });
 
   it("keeps the pre-alignment behaviour of stream forcing and reasoning opt-in", () => {

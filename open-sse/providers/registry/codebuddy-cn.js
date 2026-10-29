@@ -40,11 +40,12 @@ export default {
       "X-Product": "SaaS",
       "X-IDE-Type": "CLI",
       "X-IDE-Name": "CLI",
+      // Both of these look like daemon-only headers in the CLI source, but a
+      // captured 2.177.0 chat request carries them, so they stay. The earlier
+      // version of this file removed them on the strength of a source read that
+      // only saw the daemon call sites; the live capture is authoritative.
+      "x-codebuddy-request": "1",
       "x-requested-with": "XMLHttpRequest",
-      // x-codebuddy-request is deliberately absent: the CLI sends it only on its
-      // local daemon endpoints (/api/v1/info, /api/v1/health), never on chat.
-      // The billing/quota fetchers re-add it — see services/quota/providers/codingPlans.js
-      // and services/usage/codebuddy-cn.js.
     },
     auth: {
       combined: true,
