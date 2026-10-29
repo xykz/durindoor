@@ -59,8 +59,10 @@ for that reason.
 
 DurinDoor mirrors the request fingerprint of `@tencent-ai/codebuddy-code` so
 traffic is shaped like the vendor's own client. The current mirror target is
-**2.177.0** — the release with the highest npm download volume, and therefore the
-shape the gateway sees most often. The single source is
+**2.138.0**. The choice is not "newest" but "newest release that needs no
+counterfeiting": 2.138.0 is the last widely-used build before upstream switched its
+ids from random UUIDv4 to clock-stamped UUIDv7 (2.146.0), so every id this gateway
+sends can be produced honestly from randomness. The single source is
 `open-sse/providers/codebuddyCli.js`.
 
 ### Mirrored
@@ -71,12 +73,16 @@ shape the gateway sees most often. The single source is
 | `X-IDE-Version` | `<v>` | CLI `CliClientInfoProvider` (falls back to its own package version) |
 | `X-Product` | `SaaS` | `product.json` `deploymentType` |
 | `X-IDE-Type` / `X-IDE-Name` | `CLI` | CLI client-info provider |
-| `X-Conversation-ID` | gateway session id, re-shaped to a dashed UUIDv7 | CLI session id |
-| `X-Conversation-Request-ID`, `X-Root-Request-ID` | one per-attempt UUIDv7 (32 hex), identical in both headers | CLI per-prompt id |
-| `X-Conversation-Message-ID` | one per-attempt UUIDv7 (32 hex) | CLI message id |
-| `X-Request-ID` | the same 32-hex message id | CLI `X-Request-ID` |
+| `X-Conversation-ID` | gateway session id, hashed to a dotted UUIDv4 (or passed through when already a UUID) | CLI session id |
+| `X-Conversation-Request-ID`, `X-Root-Request-ID` | one per-attempt 32-hex trace id, identical in both headers | CLI per-prompt id, which seeds the trace |
+| `X-Conversation-Message-ID` | one per-attempt 32-hex UUIDv4 | CLI message id |
+| `X-Request-ID` | the same message id | CLI `X-Request-ID` |
+| `traceparent` | `00-<traceId>-<spanId>-01` | CLI `injectOtelSpanHeaders()` |
+| `b3` | `<traceId>-<spanId>-1-<parentSpanId>` | Same |
+| `X-B3-TraceId`, `X-Trace-ID` | the same 32-hex trace id as `X-Conversation-Request-ID` | Same — one value under four names |
+| `X-B3-SpanId` / `X-B3-ParentSpanId` | per-attempt random 16-hex ids | Same |
+| `X-B3-Sampled` | `1` | Same; the model-call span uses the default sampler |
 | `X-Agent-Intent` | `craft` | CLI default session mode |
-| `X-Agent-Runtime` | `other` | CLI default with no runtime metadata |
 | `X-Agent-Type` | `main` | CLI default with no team/parent context |
 | `X-Agent-Purpose` | `conversation` | CLI `AgentPurpose.Conversation` default |
 | `X-Private-Data` | `false` for a consumer account, `true` for an enterprise one | CLI `resolveModelOptimizationEnabled()`, disabled for enterprise accounts |
@@ -88,44 +94,65 @@ shape the gateway sees most often. The single source is
 | `x-requested-with` | `XMLHttpRequest` | Same — present on a captured chat request |
 | `Accept` | `application/json` | OpenAI SDK `buildHeaders()`; the CLI streams via the body, not this header |
 | `X-Stainless-Lang` / `-Package-Version` / `-OS` / `-Arch` / `-Runtime` / `-Runtime-Version` / `-Retry-Count` | `js`, `6.25.0`, mapped `process.platform`/`process.arch`, `node`, `process.version`, `0` | OpenAI SDK `getPlatformHeaders()`; the CLI's adapter never strips them |
-| `cache_retention` (body) | `long`, or `short` via env | CLI `resolveCacheRetention()` |
 | `verbosity` (body) | `high`, only when reasoning was requested | CLI model-settings interceptor (`text.verbosity`) |
 | `reasoning_summary` (body) | `auto`, only when reasoning was requested | CLI `injectReasoningSummaryIfNeeded()` |
 | `stream_options.include_usage` | `true` whenever `stream` is true | CLI openai body |
-| `extra_vars.harnessMetadata` (body) | JSON string, `{schemaVersion:1, harnessVersion, stepIndex:0, contextWindowId, agent:{depth:0}}` | CLI `buildHarnessMetadata()` |
-| `extra_vars.initiator` (body) | `user` | CLI `classifyUserMessageMarkers()` for a turn ending in an ordinary user message |
 | `stream` | always `true` | CodeBuddy requirement, not CLI parity |
 
+Two body fields that later releases add are deliberately **absent**, because
+2.138.0 predates both: `cache_retention` and `extra_vars` with `harnessMetadata`
+(both first captured in 2.172.1). Sending them while claiming to be 2.138.0 would
+be a newer-client tell.
+
+`verbosity` needs a note because it does *not* travel with the rest of the newer
+fields. Captured bodies show it present from 2.108.1 through 2.147.0 — always
+alongside `reasoning_effort` and `reasoning_summary`, and never on a request that
+asked for no reasoning — then absent from 2.164.0 onward. So on 2.138.0 it belongs
+with the reasoning trio, not with the newer additions.
+
+There is deliberately **no** `X-Agent-Runtime` and **no** `baggage`. 2.138.0 sends
+neither; `X-Agent-Runtime` first ships in 2.172.1 and `baggage` in 2.164.0.
+
 There is deliberately **no** `X-Stainless-Timeout`. The SDK would emit one for a
-client with a timeout, but a captured 2.177.0 request does not carry it.
+client with a timeout, but no captured request carries it.
 
 ### How this table was derived
 
-Two live chat requests from `@tencent-ai/codebuddy-code` 2.177.0 — one for
-`default-model`, one for `glm-5.2` — were captured against a local stub upstream
+Live chat requests from real `@tencent-ai/codebuddy-code` builds across a dozen
+releases (2.108.1 through 2.177.0) were captured against a local stub upstream
 rather than inferred from the bundle. That distinction matters: the CLI assembles
 headers across three layers (the fetch adapter, a custom-header provider, and the
 axios interceptor chain), so a source read reproduces only the first layer. A
 source-only pass produced four wrong conclusions here — it dropped
 `x-codebuddy-request` and `x-requested-with`, left `X-Conversation-Request-ID`
 empty, and added a `X-Stainless-Timeout` that the CLI never sends. All four were
-corrected against the capture. Re-do a capture, not a read, before changing any
-row above.
+corrected against the capture. It also mis-dated several fields: `x-agent-runtime` is absent from everything
+before 2.172.1, `baggage` from everything before 2.164.0, `cache_retention` and
+`extra_vars` from the whole 2.108–2.171 range, and `verbosity` from everything
+*after* 2.147.0. Re-do a capture, not a read, before changing any row above.
 
 The conversation id is anchored on the gateway's own session id, so consecutive
-turns of one client session keep the same id. The CLI sends its session UUIDv7
-verbatim; a non-UUIDv7 seed (a client-supplied id of any shape, or DurinDoor's
-generated `uuid + timestamp` string) is hashed into a stable UUIDv7-shaped value,
-because the gateway expects the CLI's shape and validates that nibble pattern on
-conversation request ids. Request ids are minted per attempt; the CLI reuses one
+turns of one client session keep the same id. 2.138.0 sends its session id as an
+ordinary UUIDv4, so a seed that is already a UUID is forwarded verbatim and any
+other seed is hashed straight to a UUIDv4 — no clock value is embedded. This is the
+whole reason 2.138.0 was picked: from 2.146.0 onward the CLI mints UUIDv7, whose
+first 48 bits are a real creation timestamp, and a gateway can only imitate that by
+inventing a time. Request ids are minted per attempt; the CLI reuses one
 message id across its retries, which is a deliberate, accepted difference.
 
-`X-Conversation-Request-ID` and `X-Root-Request-ID` carry the *same* value — the
-CLI's per-prompt `conversationRequestId`, which the capture showed as
-`01a1862111327a898de142708d9f4f5a` while `X-Request-ID` was
-`01a1862112127fae94693612b8643bdd`. They are therefore derived separately from the
-message id, not from it. DurinDoor has no subagent or compaction pipeline, so the
-per-prompt id doubles as the root id.
+`X-Conversation-Request-ID`, `X-Root-Request-ID`, `X-B3-TraceId` and `X-Trace-ID`
+carry the *same* value — 2.138.0 seeds its model-call span's trace id from the
+per-prompt id (`el.traceId = eh, el.conversationRequestId = eh`), and the capture
+showed all four byte-identical while `X-Request-ID` held the different message id
+(`1369a47df2d741448e0152dfc573b573` vs `x-conversation-message-id`). They are
+therefore derived separately from the message id, not from it. DurinDoor has no
+subagent or compaction pipeline, so the per-prompt id doubles as the root id.
+
+The remaining trace headers are computed from that one trace id plus two random
+16-hex span ids, exactly as `injectOtelSpanHeaders()` does. Note that the CLI can
+also *adopt* an inbound trace: `createOtelParentContextFromTraceHeaders()` reads
+`b3` (or `x-b3-traceid`/`x-trace-id` + `x-b3-spanid` + `x-b3-sampled`), requires
+`/^[0-9a-f]{32}$/i` and `/^[0-9a-f]{16}$/i`, and uses it as the parent span.
 
 ### Deliberately not mirrored
 
@@ -188,16 +215,30 @@ default 200,000 ms) so a dead upstream fails fast rather than hanging a client.
 
 ### Version history
 
-The fingerprint has moved twice. Recorded here so a future bump can tell an
-intentional difference from a stale one.
+The fingerprint has moved several times, mostly backwards. Recorded here so a
+future bump can tell an intentional difference from a stale one.
+
+The id-generation cutover is at **2.146.0**: every release up to and including
+2.145.0 mints ordinary UUIDv4 for sessions and message ids; 2.146.0 onward mints
+UUIDv7, whose first 48 bits are the creation timestamp. Upstream only began
+rejecting non-v7 conversation request ids in 2.177.0 (`"conversationRequestId must
+be a lowercase UUIDv7 encoded as 32 hexadecimal characters"`; zero occurrences
+before it). Mirroring 2.146.0–2.176.x therefore forces a gateway to synthesize a
+timestamp it does not have; mirroring 2.177.x additionally forces the id to pass a
+shape check patterned on "now".
 
 | CLI release | What it contributes | Notes |
 | --- | --- | --- |
 | **2.108.1** (2026-06-18) | The six original identity headers — `X-Conversation-ID`, `X-Conversation-Request-ID`, `X-Conversation-Message-ID`, `X-Request-ID`, `X-Agent-Intent`, `X-IDE-Version` — plus the `CLI/<v> CodeBuddy/<v>` UA shape. | No `X-Agent-Runtime`, no `X-Agent-Type`, no `cache_retention` (the constants and the resolver do not exist in this release). This is the version v3.18.0 hardcoded, and it was already stale when it was written. |
-| **2.172.1** (2026-10-21) | Adds `X-Agent-Runtime`, `X-Agent-Type` and the `cache_retention` body field (`resolveCacheRetention()` + `CODEBUDDY_DISABLE_PROMPT_CACHING_1H`). | First alignment target. Everything above except the Stainless headers and `verbosity` was already mirrored here. |
-| **2.177.0** (2026-10-26) | Current target. Adds the bundled `openai@6.25.0` Stainless request headers and `X-Stainless-Timeout`. | Chosen because it is the most-downloaded release. `X-IDE-Version` resolves through `CliClientInfoProvider` to the package version, so it is `2.177.0`, not `0.0.0`. |
+| **2.138.0** (2026-08-24) | **Current target.** Adds `X-Agent-Type` and `X-Root-Request-ID` over 2.108.1, plus the seven `b3`/`traceparent`/`X-B3-*`/`X-Trace-ID` headers, which turn out to be present this far back. | Chosen because it is the newest release that still mints UUIDv4 — so DurinDoor never counterfeits a timestamp — while sending every business header the current releases send. A capture matched it 35/35 with zero missing and zero extra headers, and 2.145.0 matches identically. No `baggage`, no `X-Agent-Runtime`. |
+| **2.145.0** (2026-09-05) | Last UUIDv4 release. Request surface identical to 2.138.0. | Equivalent target; differs only in its own prompt and tool-ordering content, which is client data, not fingerprint. |
+| **2.146.0** (2026-09-06) | First UUIDv7 release. | The cutover. Not a viable target: ids would need an invented timestamp. |
+| **2.164.0** (2026-10-09) | Adds `baggage` (`codebuddy.session_id=…,codebuddy.conversation_request_id=…`). **Drops** `verbosity`, `reasoning_effort` and `reasoning_summary` from the captured body. | Still UUIDv7. The reasoning trio returning in 2.172.1 is a separate change from `cache_retention`. |
+| **2.172.1** (2026-10-21) | Adds `X-Agent-Runtime`, `cache_retention` (`resolveCacheRetention()` + `CODEBUDDY_DISABLE_PROMPT_CACHING_1H`) and `extra_vars`; the reasoning trio is back in the body (without `verbosity`). | Earlier alignment target; superseded. |
+| **2.174.0** (2026-10-23) | Adds `harnessMetadata.contextWindowId` inside `extra_vars`. | First release whose harness metadata points at a context window. |
+| **2.177.0** (2026-10-26) | Adds `harnessMetadata.contextWindowId` and validates conversation request ids against a UUIDv7 pattern. | The most-downloaded release, but a worse target precisely because of those two additions. |
 
-Two invariants held across all three releases and are worth re-checking on a
+Two invariants held across every release and are worth re-checking on a
 future bump: the CLI streams via `stream:true` in the body rather than an
 `Accept: text/event-stream` header, and its compatibility rule chain is skipped
 entirely for the product gateway host — so `SdkFieldCleanupRule` never deletes
@@ -208,8 +249,7 @@ the `reasoning_summary` / `verbosity` the CLI itself just added.
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `CODEBUDDY_CLI_VERSION` | pinned mirror release | Version used for `User-Agent` and `X-IDE-Version`. |
-| `CODEBUDDY_DISABLE_PROMPT_CACHING_1H` | unset | Truthy → `cache_retention: "short"` instead of `"long"`. |
-| `CODEBUDDY_CLI_ALIGNMENT` | unset | `off` disables the mirrored headers and `cache_retention` entirely — the one-line rollback. |
+| `CODEBUDDY_CLI_ALIGNMENT` | unset | `off` disables every mirrored header (including the trace set) — the one-line rollback. |
 | `CODEBUDDY_SYSTEM_PROMPT_MAX_LEN` | `2000` | Prompt length threshold for the replacement rule; `0` disables the length rule only. |
 
 ## Usage and quota

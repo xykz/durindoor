@@ -3,16 +3,15 @@ import { OPENAI_BLOCK, ROLE } from "../translator/schema/index.js";
 import { isString } from "../../src/shared/utils/typeChecks.js";
 import {
   CODEBUDDY_SDK_PACKAGE_VERSION,
-  codebuddyCacheRetention,
   codebuddyCliAlignmentEnabled,
   codebuddyCliVersion,
   codebuddyConversationId,
-  codebuddyConversationRequestId,
-  codebuddyHarnessMetadata,
   codebuddyIdentityHeaders,
   codebuddyRequestId,
   codebuddyStainlessArch,
   codebuddyStainlessOs,
+  codebuddyTraceContext,
+  codebuddyTraceHeaders,
   codebuddyUserAgent,
 } from "../providers/codebuddyCli.js";
 
@@ -104,53 +103,37 @@ export class CodeBuddyExecutor extends DefaultExecutor {
     // + reasoning_summary on plain requests makes CodeBuddy trip its content
     // filter and return an error (#2071).
 
-    // The CLI's own model-settings interceptor writes text.verbosity:"high" once
-    // thinking is enabled. A captured 2.177.0 glm-5.2 request carried exactly
-    // `reasoning_effort:"high"` + `reasoning_summary:"auto"` + `verbosity:"high"`,
-    // and a default-model request (no reasoning) carried none of the three. So it
-    // is gated on the same condition rather than always sent.
+    // The CLI's model-settings interceptor writes text.verbosity:"high" whenever
+    // thinking is enabled, and a captured 2.138.0 request carried exactly
+    // `reasoning_effort:"high"` + `reasoning_summary:"auto"` + `verbosity:"high"`.
+    // It is gated on the same condition as reasoning_summary rather than sent
+    // unconditionally. (Captures show verbosity present from 2.108.1 through
+    // 2.147.0 and gone again by 2.164.0.)
     if (transformed.reasoning_summary && transformed.verbosity === undefined) {
       transformed.verbosity = "high";
     }
 
-    // The official CLI stamps every chat request with a cache retention mode,
-    // latching "long" unless CODEBUDDY_DISABLE_PROMPT_CACHING_1H is set. An
-    // explicit client value always wins. See providers/codebuddyCli.js.
-    if (codebuddyCliAlignmentEnabled() && transformed.cache_retention === undefined) {
-      transformed.cache_retention = codebuddyCacheRetention();
-    }
-
-    // Every CLI model call carries `extra_vars`, holding the harness metadata
-    // string plus an `initiator` tag. Both captured 2.177.0 requests carried
-    // `initiator:"user"`, which is what the CLI's classifyUserMessageMarkers()
-    // returns for a turn whose trailing message is an ordinary user message — the
-    // only case a gateway ever sees. See codebuddyHarnessMetadata().
-    if (codebuddyCliAlignmentEnabled() && transformed.extra_vars === undefined) {
-      const conversationId = codebuddyConversationId(
-        requestContext?.sessionId || credentials?.connectionId
-      );
-      transformed.extra_vars = {
-        harnessMetadata: codebuddyHarnessMetadata(conversationId),
-        initiator: "user",
-      };
-    }
+    // Two body fields that later releases add are deliberately absent here,
+    // because 2.138.0 predates both: `cache_retention` (first captured in
+    // 2.172.1) and `extra_vars`/`harnessMetadata` (same release). Sending them
+    // while advertising 2.138.0 would be a newer-client tell.
     return transformed;
   }
 
   /**
    * Mirror the request fingerprint the official CLI attaches to every chat call.
    *
-   * The shape below came from capturing two live 2.177.0 chat requests (one
-   * `default-model`, one `glm-5.2`) rather than from reading the bundle, because
-   * the bundle splits header assembly across three layers — the fetch adapter, a
-   * custom-header provider and the axios interceptor chain — and a source read
-   * misses whatever the later layers add.
+   * The shape below came from capturing live chat requests from real CLI builds
+   * rather than from reading the bundle, because the bundle splits header
+   * assembly across three layers — the fetch adapter, a custom-header provider
+   * and the axios interceptor chain — and a source read misses whatever the later
+   * layers add.
    *
    * The CLI derives the identity headers from its session object; DurinDoor has no
-   * session, so the conversation id is derived from the gateway's own session id
-   * and the per-prompt ids are minted per attempt. Headers built from
-   * authenticated identity state (X-Userinfo, X-Enterprise-Id, X-Auth-Method,
-   * X-Id-Source, X-User-Id) are intentionally NOT synthesized — see
+   * session, so the conversation id is derived from the gateway's own session id,
+   * and the per-prompt ids plus the trace context are minted per attempt. Headers
+   * built from login-flow state (X-Userinfo, X-Auth-Method, X-Id-Source,
+   * X-Department-Info) are intentionally NOT synthesized — see
    * docs/providers/codebuddy-cn.md.
    */
   buildHeaders(credentials = {}, stream = true, requestContext = null) {
@@ -165,21 +148,23 @@ export class CodeBuddyExecutor extends DefaultExecutor {
     if (!seed) return headers; // nothing to anchor a conversation on
 
     const messageId = codebuddyRequestId();
-    // A captured request carried the same value on both of these, and it differs
-    // from the message id: it is the per-prompt id, minted once per turn.
-    const conversationRequestId = codebuddyConversationRequestId();
+    // One value, four names. The CLI seeds its model-call span's trace id from
+    // the conversation request id and then writes that same value to
+    // X-Conversation-Request-ID, X-Root-Request-ID, X-B3-TraceId and X-Trace-ID.
+    // A capture of 2.138.0 confirmed all four were byte-identical, so they are
+    // minted together here rather than independently.
+    const trace = codebuddyTraceContext();
     headers["User-Agent"] = codebuddyUserAgent();
     headers["X-IDE-Version"] = codebuddyCliVersion();
     headers["X-Conversation-ID"] = codebuddyConversationId(seed);
-    headers["X-Conversation-Request-ID"] = conversationRequestId;
-    headers["X-Root-Request-ID"] = conversationRequestId;
+    headers["X-Conversation-Request-ID"] = trace.traceId;
+    headers["X-Root-Request-ID"] = trace.traceId;
     headers["X-Conversation-Message-ID"] = messageId;
     headers["X-Request-ID"] = messageId;
-    // CLI defaults when the session carries no mode/team/parent metadata. The
-    // purpose is the `AgentPurpose.Conversation` default every normal turn gets,
-    // and the private-data flag is what a non-enterprise account resolves to.
+    // CLI defaults when the session carries no mode/team/parent metadata: `craft`
+    // intent, the conversation purpose every normal turn gets, the top-level
+    // agent type, and the private-data flag a non-enterprise account resolves to.
     headers["X-Agent-Intent"] = "craft";
-    headers["X-Agent-Runtime"] = "other";
     headers["X-Agent-Type"] = "main";
     headers["X-Agent-Purpose"] = "conversation";
     // A non-enterprise account resolves model optimization on, so the CLI sends
@@ -187,6 +172,9 @@ export class CodeBuddyExecutor extends DefaultExecutor {
     // derived from the account token and override this default when they can.
     headers["X-Private-Data"] = "false";
     Object.assign(headers, codebuddyIdentityHeaders(credentials?.accessToken, credentials?.apiKey));
+    // All seven trace headers come from that one span context. `b3` carries four
+    // parts because the CLI always passes a parent span id.
+    Object.assign(headers, codebuddyTraceHeaders(trace));
 
     // The CLI's chat client is the bundled `openai` SDK, whose buildHeaders()
     // stamps these on every request and whose adapter never removes them. There is

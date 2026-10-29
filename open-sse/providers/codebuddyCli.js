@@ -9,18 +9,24 @@
  * (chat transport, OAuth flow, quota fetcher). Deriving all of them here means
  * one bump updates the whole surface.
  *
- * Observed against @tencent-ai/codebuddy-code 2.177.0 (product.json dated
- * 2026-10-26), which is the release with the highest npm download volume and
- * therefore the shape the gateway sees most often. See
- * docs/providers/codebuddy-cn.md for the alignment contract, the version
- * history, and the headers DurinDoor deliberately does NOT mirror.
+ * Observed against @tencent-ai/codebuddy-code 2.138.0 (product.json dated
+ * 2026-08-24). That release is user-agent-identifiable as a real CLI build that
+ * thousands of installs still run, and — the reason it was chosen over the newer
+ * ones — it predates the UUIDv7 switch: every session, message and request id it
+ * sends is an ordinary UUIDv4 (version nibble `4`) carrying no embedded
+ * timestamp, so DurinDoor never has to counterfeit a clock to look like it.
+ * Upstream started minting UUIDv7 in 2.146.0 and only began validating the shape
+ * in 2.177.0; mirroring anything from that range forces a synthesized timestamp
+ * into the conversation id. See docs/providers/codebuddy-cn.md for the alignment
+ * contract, the version history, and the headers DurinDoor deliberately does NOT
+ * mirror.
  */
 
 import { createHash, randomBytes } from "crypto";
-import { isString } from "../../src/shared/utils/typeChecks.js";
+import { isObject, isString } from "../../src/shared/utils/typeChecks.js";
 
 /** CLI release this fingerprint mirrors. Bump when the CLI's UA changes. */
-export const CODEBUDDY_CLI_VERSION = "2.177.0";
+export const CODEBUDDY_CLI_VERSION = "2.138.0";
 
 /**
  * Version of the `openai` npm package the CLI bundles. Surfaces as
@@ -30,8 +36,8 @@ export const CODEBUDDY_CLI_VERSION = "2.177.0";
 export const CODEBUDDY_SDK_PACKAGE_VERSION = "6.25.0";
 
 const VERSION_RE = /^\d+\.\d+\.\d+$/;
-/** Dashed UUIDv7, the shape the CLI uses for its session (X-Conversation-ID). */
-const UUID_V7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+/** Any dashed UUID, which the CLI forwards verbatim as its session id. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Effective CLI version. `CODEBUDDY_CLI_VERSION` overrides the pinned value so an
@@ -47,7 +53,8 @@ export function codebuddyCliVersion() {
 
 /**
  * Official CLI builds this as `buildUserAgent()`: platform/version + product/version
- * joined by a space. Result: `CLI/2.177.0 CodeBuddy/2.177.0`.
+ * joined by a space. Result: `CLI/<v> CodeBuddy/<v>`, e.g.
+ * `CLI/2.138.0 CodeBuddy/2.138.0` at the pinned version.
  *
  * @param {string} [version] - Explicit version; defaults to {@link codebuddyCliVersion}.
  * @returns {string} The User-Agent the CLI sends on chat requests.
@@ -57,36 +64,28 @@ export function codebuddyUserAgent(version) {
   return `CLI/${v} CodeBuddy/${v}`;
 }
 
-/**
- * `cache_retention` default for chat requests.
- *
- * The CLI latches `"long"` per session unless `CODEBUDDY_DISABLE_PROMPT_CACHING_1H`
- * is truthy, in which case it latches `"short"`. DurinDoor has no session object to
- * latch onto, so the value is computed per request from the same env switch.
- *
- * @returns {"long"|"short"} The retention mode to send upstream.
- */
-export function codebuddyCacheRetention() {
-  const raw = process.env.CODEBUDDY_DISABLE_PROMPT_CACHING_1H?.trim().toLowerCase();
-  if (raw === "1" || raw === "true" || raw === "yes" || raw === "on") return "short";
-  return "long";
-}
-
-// --- UUIDv7 assembly -------------------------------------------------------
-// The CLI mints both its session id and its message/request ids with `uuidv7()`
-// (a 48-bit millisecond timestamp, then version `7`, then 74 random bits). The
-// gateway validates that nibble pattern on conversation request ids, so UUIDv4
-// values — what DurinDoor used to send — do not match the CLI's shape.
+// --- UUIDv4 assembly -------------------------------------------------------
+// 2.138.0 mints its session, message and request ids with `generateUUUID()`,
+// which is `crypto.randomUUID.bind(crypto)` — an ordinary random (version 4)
+// UUID with no embedded clock. That is the whole reason this release is the
+// mirror target: a gateway can produce a byte-indistinguishable id from pure
+// randomness, whereas the CLI's later `uuidv7()` ids lead with a 48-bit
+// timestamp, so any gateway-side id either carries a real "session started now"
+// clock or a hashed one that decodes to a nonsense year.
+//
+// Upstream also had no format assertion on these ids in 2.138.0
+// (`conversationRequestId must be a lowercase UUIDv7 …` first appears in
+// 2.177.0), so nothing downstream constrains the version nibble either.
 
 /**
- * Stamps the UUIDv7 version and RFC-4122 variant nibbles onto 32 hex chars.
+ * Stamps the UUIDv4 version and RFC-4122 variant nibbles onto 32 hex chars.
  *
- * @param {string} hex - 32 lowercase hex characters (timestamp + randomness).
- * @returns {string} 32 lowercase hex characters in UUIDv7 shape.
+ * @param {string} hex - At least 32 hex characters of entropy.
+ * @returns {string} 32 lowercase hex characters in UUIDv4 shape.
  */
-function asUuidV7Hex(hex) {
+function asUuidV4Hex(hex) {
   const chars = hex.slice(0, 32).split("");
-  chars[12] = "7";
+  chars[12] = "4";
   const variant = ((parseInt(chars[16], 16) || 0) & 0x3) | 0x8;
   chars[16] = variant.toString(16);
   return chars.join("");
@@ -103,87 +102,103 @@ function dashUuid(hex) {
 }
 
 /**
- * Current millisecond clock as the 12 hex characters a UUIDv7 starts with.
+ * Dash-stripped UUIDv4, the shape the CLI sends on X-Request-ID and
+ * X-Conversation-Message-ID (which it always sets to the same value) and on
+ * X-Conversation-Request-ID.
  *
- * @returns {string} 12 lowercase hex characters.
+ * @returns {string} 32 hex characters, version nibble `4`.
  */
-function uuidV7Timestamp() {
-  return Date.now().toString(16).padStart(12, "0").slice(-12);
+function uuidV4Hex() {
+  return asUuidV4Hex(randomBytes(16).toString("hex"));
 }
 
 /**
- * Per-request identifier in the CLI's shape: a UUIDv7 with the dashes stripped
- * (32 lowercase hex characters, version nibble `7`). Used for both X-Request-ID
- * and X-Conversation-Message-ID, which the CLI always sets to the same value.
+ * Per-request identifier: MESSAGE id, sent on both X-Request-ID and
+ * X-Conversation-Message-ID.
  *
- * @returns {string} 32 hex characters in UUIDv7 shape (version nibble `7`).
+ * @returns {string} 32 hex characters in UUIDv4 shape.
  */
 export function codebuddyRequestId() {
-  const random = randomBytes(10).toString("hex");
-  return asUuidV7Hex(`${uuidV7Timestamp()}${random}`);
+  return uuidV4Hex();
 }
 
 /**
  * Conversation identifier for X-Conversation-ID.
  *
- * The CLI sends its session UUIDv7 verbatim, so a client-supplied UUIDv7 is
- * passed through unchanged. Anything else — a non-UUID session id, or a UUID of
- * a different version — is hashed into a stable UUIDv7-shaped value, because the
- * gateway expects the CLI's shape and DurinDoor's session ids come from
- * `resolveSessionId` (client-supplied id of any shape, or a generated
- * `uuid + timestamp` string). The same seed therefore always yields the same
- * conversation id, and a different seed a different one.
+ * The CLI sends its session id verbatim, whatever its shape, so a client-supplied
+ * value is passed through unchanged (a capture with `--session-id arbitrary_session-42`
+ * went upstream as `x-conversation-id: arbitrary_session-42`). Anything else is
+ * hashed into a stable dashed UUIDv4, because DurinDoor's session ids come from
+ * `resolveSessionId` (a client-supplied id of any shape, or a generated
+ * `uuid + timestamp` string) and a stable conversation id is what keeps the
+ * gateway's turns grouped. Hashing yields no timestamp, so nothing in the id
+ * reveals that a gateway rather than the CLI minted it.
  *
  * @param {string} [seed] - Session or connection identifier.
- * @returns {string} A dashed UUIDv7-shaped conversation id.
+ * @returns {string} A dashed UUIDv4, or the seed itself when it is already a UUID.
  */
 export function codebuddyConversationId(seed) {
-  const value = isString(seed) ? seed.trim().toLowerCase() : "";
-  if (value && UUID_V7_RE.test(value)) return value;
-  const digest = createHash("sha256").update(`codebuddy-cn:${value || "anonymous"}`).digest("hex");
-  return dashUuid(asUuidV7Hex(digest));
+  const value = isString(seed) ? seed.trim() : "";
+  if (value && UUID_RE.test(value)) return value;
+  const digest = createHash("sha256")
+    .update(`codebuddy-cn:${value.toLowerCase() || "anonymous"}`)
+    .digest("hex");
+  return dashUuid(asUuidV4Hex(digest));
 }
 
 /**
- * Conversation request id for X-Conversation-Request-ID and X-Root-Request-ID.
+ * A fresh trace context, as the CLI's OTEL span produces it.
  *
- * The CLI generates one per prompt (`generateConversationRequestId()`), sets it on
- * the session before the model call, and stamps the same value on both headers —
- * verified against a live 2.177.0 run, where the two headers were byte-identical.
- * It is a UUIDv7 with the dashes stripped, not the message id: a captured request
- * carried `x-conversation-request-id: 01a1862111327a898de142708d9f4f5a` alongside
- * `x-request-id: 01a1862112127fae94693612b8643bdd`.
+ * The CLI's `injectOtelSpanHeaders()` derives all seven trace headers from one
+ * span context, and it seeds that span's trace id from the conversation request
+ * id (`traceId` falls back to `crypto.randomBytes(16).toString("hex")` and is then
+ * written to `traceId`, `conversationRequestId` and `lastConversationTraceId`
+ * alike). A captured 2.138.0 request therefore carried
+ * `x-conversation-request-id === x-root-request-id === x-b3-traceid === x-trace-id`
+ * — one value under four names. Minting them separately is the one thing a real
+ * CLI can never do.
  *
- * @returns {string} 32 hex characters in UUIDv7 shape.
+ * `sampled` is always 1: the CLI's model-call span is created with the default
+ * sampler, and every capture showed `x-b3-sampled: 1` with traceparent flags
+ * `-01`.
+ *
+ * @returns {{traceId: string, spanId: string, parentSpanId: string, sampled: boolean}}
+ *   32 hex trace id, 16 hex span id, 16 hex parent span id (the CLI always has a
+ *   parent: the run's root span), and the sampled flag.
  */
-export function codebuddyConversationRequestId() {
-  return codebuddyRequestId();
+export function codebuddyTraceContext() {
+  return {
+    traceId: randomBytes(16).toString("hex"),
+    spanId: randomBytes(8).toString("hex"),
+    parentSpanId: randomBytes(8).toString("hex"),
+    sampled: true,
+  };
 }
 
 /**
- * `harnessMetadata` value for the `extra_vars` body field.
+ * The seven W3C/B3 headers the CLI stamps from one span context.
  *
- * The CLI stamps a JSON *string* here on every model call. A captured 2.177.0
- * request carried exactly:
- * `{"schemaVersion":1,"harnessVersion":"2.177.0","stepIndex":0,"contextWindowId":"01a18621-1213-7a39-97ad-580ba22bca96","agent":{"depth":0}}`
- * DurinDoor has no turn/step pipeline, so `stepIndex` is always 0 and `depth` is
- * always 0 (top-level agent, not a subagent). `contextWindowId` reuses the
- * conversation id, which is per-session exactly as the CLI's context window is;
- * the CLI mints it separately (the captured value differed from both the session
- * id and the conversation request id) but nothing upstream was observed to
- * correlate the two, so one id keeps the gateway's state simpler.
+ * Mirrors `injectOtelSpanHeaders()` verbatim, including the B3 single-header
+ * parent suffix: `b3` is only four hyphen-separated parts because the CLI always
+ * passes a parent span id here.
  *
- * @param {string} conversationId - Dashed conversation id.
- * @returns {string} JSON-encoded harness metadata.
+ * @param {{traceId: string, spanId: string, parentSpanId: string, sampled: boolean}} ctx
+ *   Trace context from {@link codebuddyTraceContext}.
+ * @returns {object} Header name/value pairs.
  */
-export function codebuddyHarnessMetadata(conversationId) {
-  return JSON.stringify({
-    schemaVersion: 1,
-    harnessVersion: codebuddyCliVersion(),
-    stepIndex: 0,
-    contextWindowId: isString(conversationId) ? conversationId : "",
-    agent: { depth: 0 },
-  });
+export function codebuddyTraceHeaders(ctx) {
+  const { traceId, spanId, parentSpanId, sampled } = ctx;
+  const flag = sampled ? "1" : "0";
+  const headers = {
+    traceparent: `00-${traceId}-${spanId}-${sampled ? "01" : "00"}`,
+    b3: `${traceId}-${spanId}-${flag}${parentSpanId ? `-${parentSpanId}` : ""}`,
+    "X-B3-TraceId": traceId,
+    "X-B3-SpanId": spanId,
+    "X-B3-Sampled": flag,
+    "X-Trace-ID": traceId,
+  };
+  if (parentSpanId) headers["X-B3-ParentSpanId"] = parentSpanId;
+  return headers;
 }
 
 /**
@@ -239,7 +254,7 @@ function decodeJwtClaims(token) {
   try {
     const payload = Buffer.from(parts[1], "base64url").toString("utf8");
     const claims = JSON.parse(payload);
-    return claims && typeof claims === "object" ? claims : null;
+    return claims !== null && isObject(claims) && !Array.isArray(claims) ? claims : null;
   } catch {
     return null;
   }
@@ -248,7 +263,7 @@ function decodeJwtClaims(token) {
 /**
  * Identity headers the CLI derives from its authenticated session.
  *
- * A captured 2.177.0 request made with a real account token carried
+ * A captured request made with a real account token carried
  * `X-User-Id: <token sub>` and `X-Domain: <iss host>`; the same request made
  * without a token carried neither, and `X-User-Id` degraded to `anonymous`.
  * That establishes both headers as token-derived rather than constants.

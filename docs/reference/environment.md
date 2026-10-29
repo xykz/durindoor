@@ -139,9 +139,8 @@ alignment contract.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `CODEBUDDY_CLI_VERSION` | the version in `open-sse/providers/codebuddyCli.js` | CLI release the `User-Agent`, `X-IDE-Version` and `harnessMetadata.harnessVersion` are derived from. Malformed values fall back to the pinned version. |
-| `CODEBUDDY_DISABLE_PROMPT_CACHING_1H` | unset (`"long"`) | Truthy values make chat requests send `cache_retention: "short"` instead of the CLI default `"long"`. |
-| `CODEBUDDY_CLI_ALIGNMENT` | unset (enabled) | `off` stops sending the mirrored headers, `cache_retention` and `extra_vars`, reverting to the pre-alignment request shape. |
+| `CODEBUDDY_CLI_VERSION` | the version in `open-sse/providers/codebuddyCli.js` (currently `2.138.0`) | CLI release the `User-Agent` and `X-IDE-Version` are derived from. Malformed values fall back to the pinned version. The pinned release predates the UUIDv7 cutover at 2.146.0, so raising this past that point makes the emitted ids disagree with the advertised version. |
+| `CODEBUDDY_CLI_ALIGNMENT` | unset (enabled) | `off` stops sending every mirrored header — identity, conversation and the seven trace headers — reverting to the pre-alignment request shape. |
 | `CODEBUDDY_SYSTEM_PROMPT_MAX_LEN` | `2000` | System prompts longer than this are replaced by a neutral prompt. `0` disables only the length rule. |
 
 ## Translator and Provider Debugging
