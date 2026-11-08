@@ -161,14 +161,32 @@ function reservationItem(row) {
   };
 }
 
+function windowRecurring(row) {
+  const recurring = row?.provenance?.metadata?.recurring;
+  if (recurring === true) return true;
+  if (recurring === false) return false;
+  return null;
+}
+
 function routingWindow(row) {
   const ratio = rowRatio(row);
   if (ratio === null) return null;
+  const remaining = row?.amounts?.remaining;
   return {
     resourceKey: row.identity.resourceKey,
     dimensionKey: row.identity.dimensionKey,
     unit: row.amounts.unit || namespaceOf(row.identity.dimensionKey) || null,
-    ratio
+    ratio,
+    // Additive selection metadata: the pool's expiry (bonus packs expire for
+    // good at this instant, refill packs only refresh), whether it is a
+    // recurring allowance, and the absolute amount left. Routing floors and
+    // scoring read only `ratio`, so a window that omits these stays fully
+    // compatible. The absolute amount is required for cross-pool comparison
+    // because `ratio` is per-pool (each one-shot pack has its own capacity), so
+    // two windows at ratio 0.5 can hold wildly different credit amounts.
+    resetAt: row?.timing?.resetAt || null,
+    recurring: windowRecurring(row),
+    remaining: isNumber(remaining) && Number.isFinite(remaining) && remaining >= 0 ? remaining : null
   };
 }
 

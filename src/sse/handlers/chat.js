@@ -42,6 +42,7 @@ import { detectFormat } from "open-sse/services/provider.js";
 import { isAntigravityCapacityError, isRequestReplayBufferError } from "open-sse/services/accountFallback.js";
 import { resolveClientSessionId, parseSessionAffinityTtl } from "open-sse/utils/sessionManager.js";
 import { parseTokenBudget } from "@/shared/utils/tokenBudget.js";
+import { parseAccountStrategy } from "@/shared/utils/accountStrategy.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials } from "../services/tokenRefresh.js";
 import { refreshAndUpdateCredentials } from "@/shared/services/providerCredentials";
@@ -863,6 +864,13 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     clientRawRequest?.headers?.["x-connection-token-budget"]
   );
 
+  // Per-request account-selection strategy override. `x-account-strategy:
+  // bonus-first` spends one-shot credit packs in expiry order instead of the
+  // configured strategy; missing or unknown values keep the stored strategy.
+  const accountStrategy = parseAccountStrategy(
+    clientRawRequest?.headers?.["x-account-strategy"]
+  );
+
   // Resolve request-scoped custom capabilities once, just before the retry loop.
   // Custom model aliases are stored by provider prefix; requestPrefix carries
   // the prefix the caller actually used (e.g. node alias or bare model alias).
@@ -913,7 +921,8 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
           preferredConnectionId: preferredConnectionId || requestReplayConnectionId,
           preferredConnectionIds: requestReplayConnectionId ? [requestReplayConnectionId] : preferredConnectionIds,
           sessionAffinityTtlMs,
-          connectionTokenBudget
+          connectionTokenBudget,
+          accountStrategy
         });
       } catch (error) {
         if (error?.name === "AbortError" || requestAborted(request, requestSignal)) return errorResponse(499, "Request aborted");

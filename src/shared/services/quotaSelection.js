@@ -6,11 +6,99 @@ import {
 } from "open-sse/config/quotaSelection.js";
 import { rankQuotaCandidates } from "open-sse/services/quota/scoring.js";
 import { quotaIdentityKey } from "@/shared/utils/quotaSnapshot";
+import { isNumber } from "../utils/typeChecks.js";
 import { QuotaDispatchUnavailableError } from "open-sse/services/quota/dispatch.js";
 
 const OWNER_EPOCH = createHash("sha256")
   .update(`${randomUUID()}:${process.pid}:${Date.now()}`)
   .digest("hex");
+
+/**
+ * The earliest expiry day on which an account's one-shot credits vanish.
+ *
+ * One-shot packs are grouped by the calendar day of their own `resetAt` (the
+ * date prefix of the provider's ISO timestamp — deliberately not a local
+ * "today", so no timezone is involved: only the relative order between packs
+ * matters). Recurring allowances are excluded because their `resetAt` is the
+ * next refill, not the moment the credits disappear, so spending them early
+ * wastes nothing.
+ *
+ * The account's ranking key is its EARLIEST day, and `total` sums the credits
+ * of every pack expiring on that day — a day's worth of packs is one budget,
+ * and `ratio` cannot be compared across packs because each pack carries its own
+ * capacity.
+ *
+ * @param {{ routingWindows?: Array<{ratio?: number, resetAt?: string|null, recurring?: boolean|null, remaining?: number|null}> }|null} profile
+ * @param {number} [now] - Reference clock.
+ * @returns {{ day: string, total: number, earliestResetAt: number|null }|null}
+ *   Earliest expiring day, its credit total, and the exact instant within that
+ *   day, or null when the account holds no usable one-shot pack.
+ */
+export function bonusBucketOf(profile, now = Date.now()) {
+  const windows = Array.isArray(profile?.routingWindows) ? profile.routingWindows : [];
+  const clock = Number(now);
+  const reference = Number.isFinite(clock) ? clock : Date.now();
+  let day = null;
+  let total = 0;
+  let earliestResetAt = null;
+  for (const window of windows) {
+    if (window?.recurring !== false) continue;
+    const remaining = window?.remaining;
+    // `routingWindow` normalizes the amount to a finite number or null, so
+    // `null` here genuinely means "unknown", not "zero".
+    const hasAmount = isNumber(remaining) && Number.isFinite(remaining);
+    // A pack counts while it still holds credits. When the snapshot carries no
+    // absolute amount, fall back to the ratio so an observable pack is not
+    // silently dropped from its day; it then contributes 0 to the total.
+    if (!(hasAmount && remaining > 0) && !(!hasAmount && Number(window?.ratio) > 0)) continue;
+    const expiresAt = Date.parse(window?.resetAt || "");
+    if (!Number.isFinite(expiresAt) || expiresAt <= reference) continue;
+    const expiresOn = new Date(expiresAt).toISOString().slice(0, 10);
+    if (day === null || expiresOn < day) {
+      day = expiresOn;
+      total = 0;
+      earliestResetAt = null;
+    }
+    if (expiresOn !== day) continue;
+    if (hasAmount && remaining > 0) total += remaining;
+    if (earliestResetAt === null || expiresAt < earliestResetAt) earliestResetAt = expiresAt;
+  }
+  if (day === null) return null;
+  return { day, total, earliestResetAt };
+}
+
+/**
+ * Order two accounts sharing one expiry day, so a bigger budget is drained
+ * first while still rotating instead of pinning.
+ *
+ * This is an ORDER, not a filter: the caller advances through it round-robin,
+ * so a large budget takes the first turn of every cycle without absorbing every
+ * request. Ranking strictly by amount here would keep sending traffic to the
+ * biggest account until its snapshot dropped, starving the others; ranking by
+ * amount inside the rotation keeps "spend the most credits first" true for the
+ * starting order while still spreading load.
+ *
+ * Equal totals fall through to the exact instant, with a bounded tolerance so
+ * two packs the provider reports in one second do not trade turns on clock
+ * noise. A 0 lets the caller continue to its own order.
+ *
+ * @param {{total?: number, earliestResetAt?: number|null}|null} left
+ * @param {{total?: number, earliestResetAt?: number|null}|null} right
+ * @param {number} [tieMs] - Exact-instant differences at or below this are a tie.
+ * @returns {number} -1 when `left` should take the turn first, 1 when later, 0 on a tie.
+ */
+export function compareBonusRotation(left, right, tieMs = QUOTA_SELECTION_DEFAULTS.bonusExpiryTieMs) {
+  const totalLeft = Number(left?.total) || 0;
+  const totalRight = Number(right?.total) || 0;
+  if (totalLeft !== totalRight) return totalLeft > totalRight ? -1 : 1;
+  const resetLeft = Number(left?.earliestResetAt);
+  const resetRight = Number(right?.earliestResetAt);
+  if (Number.isFinite(resetLeft) && Number.isFinite(resetRight)) {
+    if (Math.abs(resetLeft - resetRight) <= tieMs) return 0;
+    return resetLeft < resetRight ? -1 : 1;
+  }
+  return 0;
+}
 
 function healthOf(connection) {
   if (connection?.testStatus === "unavailable" || connection?.isActive === false) return "unhealthy";

@@ -28,7 +28,8 @@ import {
 import { resolveFallbackModelScope } from "open-sse/services/fallbackScope.js";
 import { getProviderQuotaConfig } from "open-sse/config/providerQuota.js";
 import { getModelQuotaFamily, PROVIDER_ID_TO_ALIAS } from "open-sse/config/providerModels.js";
-import { rankQuotaConnections } from "@/shared/services/quotaSelection";
+import { rankQuotaConnections, bonusBucketOf, compareBonusRotation } from "@/shared/services/quotaSelection";
+import { isRoundRobinStrategy, parseAccountStrategy } from "@/shared/utils/accountStrategy.js";
 import { quotaDecisionDiagnostic } from "open-sse/services/quota/scoring.js";
 import { isQoderQuotaExhaustedBody } from "open-sse/executors/qoder.js";
 import { isOverLimit, recordRequest, retryAfterMs } from "./rpmLimiter.js";
@@ -470,6 +471,11 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
   options.connectionTokenBudget > 0 ?
   Math.floor(options.connectionTokenBudget) :
   null;
+  // Optional per-request strategy override (e.g. `x-account-strategy:
+  // bonus-first`). Runs a round-robin that spends one-shot credit pools in
+  // expiry order. Unknown/absent values keep the persisted strategy; accounts
+  // without any expiring pool fall back to plain round-robin ordering.
+  const accountStrategy = parseAccountStrategy(options?.accountStrategy);
   // Acquire the provider-scoped selection turn. SQLite reservations, not this
   // mutex, remain the global capacity authority at dispatch time.
   const currentMutex = selectionMutexes.get(providerId) || Promise.resolve();
@@ -676,9 +682,17 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     }
 
     const selectionSettings = await getSettings();
-    // Per-provider strategy overrides global setting.
+    // Per-provider strategy overrides global setting; a per-request header
+    // override (`accountStrategy`) outranks both for this call only.
     const providerOverride = (selectionSettings.providerStrategies || {})[providerId] || {};
-    const strategy = providerOverride.fallbackStrategy || selectionSettings.fallbackStrategy || "fill-first";
+    const strategy = accountStrategy ||
+    providerOverride.fallbackStrategy ||
+    selectionSettings.fallbackStrategy ||
+    "fill-first";
+    // `bonus-first` is a round-robin variant: it uses the same advance machinery
+    // and only reorders the comparator by credit expiry.
+    const roundRobin = isRoundRobinStrategy(strategy);
+    const bonusFirst = strategy === "bonus-first";
     let quotaRanked = false;
     if (availableConnections.some((candidate) => quotaDecisions.get(candidate.id)?.quotaProfile?.tracked)) {
       try {
@@ -728,7 +742,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     // otherwise fetch it once. Read-only signal; a null/empty map (other
     // providers, read failure) leaves lastUsedAt/priority ordering untouched.
     const usageTotals = connectionTokenTotals ||
-    (providerId === "codebuddy-cn" && strategy === "round-robin" ?
+    (providerId === "codebuddy-cn" && roundRobin ?
     await getConnectionTokenTotals24h(
       availableConnections.map((candidate) => candidate.id),
       new Date(selectionNow)
@@ -738,17 +752,66 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     //   1. explicit preferredConnectionId pin
     //   2. round-robin session affinity (a session keeps its account)
     //   3. quota-ranked top candidate, but only for NON round-robin strategies
-    //   4. round-robin advance by lastUsedAt (LRU), or fill-first priority order
-    //      (codebuddy-cn refines step 4 with the rolling-24h token total)
+    //   4. round-robin advance by bonus expiry, then lastUsedAt (LRU), or
+    //      fill-first priority order (codebuddy-cn refines step 4 with the
+    //      rolling-24h token total)
     // Round-robin deliberately ignores the quota rank for the final pick: quota
     // only reorders the pool/eligibility above, so a saturated ranking (every
     // account comparable at ratio 1.0) cannot pin one account for every session.
     // For round-robin, honor existing session affinity before quota ranking so
     // a session that already picked an account stays on it when it remains eligible.
-    const stickyConnectionId = sessionId && strategy === "round-robin" ?
+    const stickyConnectionId = sessionId && roundRobin ?
     getSessionAffinity(providerId, sessionId, sessionAffinityTtlMs) :
     null;
-    const stickyConnection = stickyConnectionId ?
+    // bonus-first: the account holding the earliest-expiring one-shot credit
+    // pool wins, because those credits vanish at the deadline while a refill
+    // allowance comes back. Packs are grouped by the calendar day of their own
+    // expiry, and a day's packs form one budget (see bonusBucketOf).
+    //
+    // The expiry DAY is the only hard tier: requests are distributed among the
+    // accounts sharing the earliest day, ordered by credits descending, and
+    // advance round-robin through that order. Ranking strictly by amount instead
+    // would pin every request to the largest account until its 60s-old snapshot
+    // dropped, leaving the others untouched.
+    //
+    // Memoized: the ordering, the affinity check and the rotation cursor all ask
+    // for the same accounts, and each bucket walks every routing window.
+    const buckets = new Map();
+    const bucketOfId = (id) => {
+      if (!bonusFirst || !id) return null;
+      if (!buckets.has(id)) {
+        buckets.set(id, bonusBucketOf(quotaDecisions.get(id)?.quotaProfile || null, selectionNow));
+      }
+      return buckets.get(id);
+    };
+    // Accounts holding no expiring budget are not part of the rotation; their
+    // credits cost nothing by lapsing, so they wait behind the urgent cohort.
+    const urgentDay = bonusFirst ?
+    availableConnections.reduce((earliest, candidate) => {
+      const day = bucketOfId(candidate.id)?.day;
+      if (!day) return earliest;
+      return earliest === null || day < earliest ? day : earliest;
+    }, null) :
+    null;
+    const urgentConnections = bonusFirst && urgentDay !== null ?
+    availableConnections.filter((candidate) => bucketOfId(candidate.id)?.day === urgentDay) :
+    availableConnections;
+    // Rotation order for the urgent cohort: biggest same-day budget first, then
+    // exact expiry instant, then the caller's stable order. `Array.prototype.sort`
+    // is stable, so equal buckets keep their original relative order.
+    const rotationOrder = bonusFirst && urgentDay !== null ?
+    [...urgentConnections].sort((a, b) => compareBonusRotation(bucketOfId(a.id), bucketOfId(b.id))) :
+    null;
+    // Affinity survives only while the session's account still holds the most
+    // urgent expiring budget. Once another account's credits expire on an
+    // earlier day, staying put would let those lapse, so the session follows the
+    // rotation instead (requirement: cross a day boundary and affinity is cut).
+    // With no expiring budget anywhere there is nothing to lose, so affinity is
+    // kept as-is.
+    const affinityEligible = !bonusFirst ||
+    urgentDay === null ||
+    bucketOfId(stickyConnectionId)?.day === urgentDay;
+    const stickyConnection = stickyConnectionId && affinityEligible ?
     availableConnections.find((c) => c.id === stickyConnectionId) :
     null;
 
@@ -767,7 +830,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       connection = (await updateProviderConnection(connection.id, {
         lastUsedAt: new Date().toISOString()
       })) || connection;
-    } else if (quotaRanked && strategy !== "round-robin") {
+    } else if (quotaRanked && !roundRobin) {
       // Persistent pressure + last-selection history provide the fairness tier
       // for quota-comparable accounts. Atomic acquire remains the final arbiter.
       // Under round-robin, quota score only reorders the candidate pool (above);
@@ -775,11 +838,65 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       // saturated pool (e.g. every account at ratio 1.0) cannot pin the
       // highest-priority account for every new session.
       connection = availableConnections[0];
-    } else if (strategy === "round-robin") {
+    } else if (roundRobin) {
       const stickyLimit = providerOverride.stickyRoundRobinLimit || selectionSettings.stickyRoundRobinLimit || 3;
-
+      // A single monotonic turn counter, shared by every account of the
+      // provider, is what makes bonus-first's rotation exact. `lastUsedAt` is
+      // millisecond precision and two picks can land in the same millisecond;
+      // `consecutiveUseCount` (already persisted per connection) then decides
+      // which account turned last, and the next turn falls to whichever follows
+      // it in `rotationOrder`.
+      const turnOf = (candidate) => Number(candidate?.consecutiveUseCount) || 0;
+      // Only bonus-first reuses this counter as its turn cursor; the default
+      // round-robin still resets it to 1 so `stickyLimit` keeps counting the
+      // current streak.
+      const turnValue = (picked) => {
+        if (!bonusFirst) return 1;
+        const highest = availableConnections.reduce(
+          (best, candidate) => Math.max(best, turnOf(candidate)),
+          turnOf(picked)
+        );
+        return highest + 1;
+      };
       const pickOldest = () => {
         const totalOf = (candidate) => usageTotals?.get(candidate.id);
+        // `rotationOrder` exists only when some account holds a usable one-shot
+        // pack. Without one there is nothing that can lapse, so the established
+        // round-robin order takes over instead of the credit rotation.
+        if (bonusFirst && rotationOrder) {
+          // `rotationOrder` lists the urgent day's accounts biggest budget
+          // first, so the turn order IS the ordering: draining in that order
+          // spends the largest budget first while still spreading load
+          // (A→B→C→A…), instead of pinning the largest account until its ~60s
+          // old snapshot drops. The 24h token total is deliberately not used
+          // here — it exists to spread the default rotation and would fight the
+          // credit order bonus-first is meant to serve.
+          const candidates = rotationOrder;
+          const indexOf = new Map(candidates.map((c, index) => [c.id, index]));
+          // The anchor is the single account that turned last, identified by the
+          // strictly highest cursor. On the very first turn every cursor is
+          // equal, so there is no anchor and the credit order starts the cycle.
+          const highestCursor = candidates.reduce(
+            (best, candidate) => Math.max(best, turnOf(candidate)),
+            -1
+          );
+          const anchorIndex = candidates.filter((candidate) => turnOf(candidate) === highestCursor).length === 1
+            ? candidates.findIndex((candidate) => turnOf(candidate) === highestCursor)
+            : -1;
+          // Turn position in the cycle is the ONLY key: the largest budget goes
+          // first, then the next account, wrapping around. Recency is not
+          // consulted because the cursor already encodes it exactly, and mixing
+          // the two let a millisecond-precision timestamp tie pin one account.
+          const turnDistance = (candidate) => {
+            const index = indexOf.get(candidate.id) ?? 0;
+            if (anchorIndex === -1) return index;
+            const offset = (index - anchorIndex + candidates.length) % candidates.length;
+            // Distance runs 1..n: the account that turned last gets the full
+            // cycle, so it is never re-picked.
+            return offset || candidates.length;
+          };
+          return [...candidates].sort((a, b) => turnDistance(a) - turnDistance(b))[0];
+        }
         const sortedByOldest = [...availableConnections].sort((a, b) => {
           // codebuddy-cn: fewer tokens today wins before recency. Equal totals
           // (or a missing signal) fall through to the original ordering.
@@ -798,7 +915,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         connection = pickOldest();
         connection = (await updateProviderConnection(connection.id, {
           lastUsedAt: new Date().toISOString(),
-          consecutiveUseCount: 1
+          consecutiveUseCount: turnValue(connection)
         })) || connection;
       } else {
         // Sort by lastUsed (most recent first) to find current candidate
@@ -812,7 +929,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         const current = byRecency[0];
         const currentCount = current?.consecutiveUseCount || 0;
 
-        if (current && current.lastUsedAt && currentCount < stickyLimit) {
+        // bonus-first keeps no sticky turns: every request must land on whichever
+        // account expires soonest right now, and holding one account for
+        // `stickyLimit` requests would leave another account's credits to lapse.
+        if (!bonusFirst && current && current.lastUsedAt && currentCount < stickyLimit) {
           // Stay with current account
           connection = current;
           // Update lastUsedAt and increment count (await to ensure persistence)
@@ -823,10 +943,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         } else {
           connection = pickOldest();
 
-          // Update lastUsedAt and reset count to 1 (await to ensure persistence)
+          // Update lastUsedAt and advance the turn cursor (await to ensure persistence)
           connection = (await updateProviderConnection(connection.id, {
             lastUsedAt: new Date().toISOString(),
-            consecutiveUseCount: 1
+            consecutiveUseCount: turnValue(connection)
           })) || connection;
         }
       }
@@ -835,7 +955,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       connection = availableConnections[0];
     }
 
-    if (connection && strategy === "round-robin" && sessionId) {
+    if (connection && roundRobin && sessionId) {
       rememberSessionAffinity(providerId, sessionId, connection.id);
     }
 

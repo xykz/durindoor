@@ -351,4 +351,44 @@ describe("connection pinning", () => {
       expect.objectContaining({ connectionTokenBudget: null }),
     );
   });
+
+  it("parses x-account-strategy and forwards it to selection", async () => {
+    await handleChat(request({}, { headers: { "x-account-strategy": "bonus-first" } }));
+    expect(mocks.getProviderCredentials).toHaveBeenCalledWith(
+      "codex",
+      expect.any(Set),
+      "gpt-5.4",
+      expect.objectContaining({ accountStrategy: "bonus-first" }),
+    );
+  });
+
+  it("normalizes the account strategy header before forwarding", async () => {
+    await handleChat(request({}, { headers: { "x-account-strategy": "  BONUS-FIRST " } }));
+    expect(mocks.getProviderCredentials).toHaveBeenCalledWith(
+      "codex",
+      expect.any(Set),
+      "gpt-5.4",
+      expect.objectContaining({ accountStrategy: "bonus-first" }),
+    );
+  });
+
+  it("leaves the account strategy unset for an unknown header value", async () => {
+    await handleChat(request({}, { headers: { "x-account-strategy": "earliest-expiry" } }));
+    expect(mocks.getProviderCredentials).toHaveBeenCalledWith(
+      "codex",
+      expect.any(Set),
+      "gpt-5.4",
+      expect.objectContaining({ accountStrategy: null }),
+    );
+  });
+
+  it("leaves the account strategy unset when the header is absent", async () => {
+    await handleChat(request({}));
+    expect(mocks.getProviderCredentials).toHaveBeenCalledWith(
+      "codex",
+      expect.any(Set),
+      "gpt-5.4",
+      expect.objectContaining({ accountStrategy: null }),
+    );
+  });
 });

@@ -289,6 +289,507 @@ describe("quota-aware provider selection", () => {
     expect(selected.connectionId).toBe("one");
   });
 
+  // ── bonus-first (x-account-strategy) ──────────────────────────────────────
+  // CodeBuddy CN bonus packs are one-shot: unused credits vanish at
+  // CycleEndTime. The expiry DAY is the hard gate (accounts whose packs lapse
+  // later wait), and within that day the credit totals set the rotation order:
+  // the largest budget takes the first turn, then the next, wrapping around.
+  // Ranking alone would pin every request on the largest account until its ~60s
+  // old snapshot refreshes, which is both wasteful and a single-account rate
+  // limit risk, so the order is walked round-robin instead.
+
+  function bonusRow(connectionId, name, { remaining = 10, limit = 10, resetAt, recurring = false } = {}) {
+    return {
+      identity: {
+        connectionId,
+        provider: "codebuddy-cn",
+        accountKey: "scope:connection",
+        resourceKey: `package:${name}`,
+        dimensionKey: "credits:capacity",
+      },
+      state: remaining === 0 ? "exhausted" : remaining / limit <= 0.1 ? "low" : "available",
+      amounts: {
+        limitKind: "bounded",
+        limit,
+        used: limit - remaining,
+        remaining,
+        remainingRatio: remaining / limit,
+        unit: "credits",
+      },
+      timing: {
+        observedAt: new Date(NOW - 1000).toISOString(),
+        staleAt: new Date(NOW + 60_000).toISOString(),
+        resetAt: resetAt === undefined ? null : new Date(resetAt).toISOString(),
+        cooldownUntil: null,
+      },
+      provenance: {
+        sourceType: "provider_api",
+        sourceId: "codebuddy-cn:billing-meter:v1",
+        reasonCode: null,
+        metadata: { recurring },
+      },
+    };
+  }
+
+  it("bonus-first spends the soonest-expiring bonus pack regardless of recency", async () => {
+    // "two" was used most recently and has fewer tokens today, so plain
+    // round-robin would pick it; "one" holds a pack expiring in 1h.
+    mocks.getProviderConnections.mockResolvedValue([
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 3 },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin", stickyRoundRobinLimit: 3 });
+    mocks.getConnectionTokenTotals24h.mockResolvedValue(new Map([["one", 9_000], ["two", 100]]));
+
+    const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+      now: NOW,
+      accountStrategy: "bonus-first",
+      quotaSnapshotsLoader: async () => [
+        bonusRow("one", "bonus-1", { resetAt: NOW + 3_600_000 }),
+        bonusRow("two", "bonus-1", { resetAt: NOW + 30 * 86_400_000 }),
+      ],
+    });
+
+    expect(selected.connectionId).toBe("one");
+  });
+
+  it("bonus-first prefers the earliest of several expiring packs", async () => {
+    mocks.getProviderConnections.mockResolvedValue([
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+
+    const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+      now: NOW,
+      accountStrategy: "bonus-first",
+      quotaSnapshotsLoader: async () => [
+        // "one" holds a later pack plus an already-empty soon one.
+        bonusRow("one", "bonus-1", { remaining: 0, resetAt: NOW + 600_000 }),
+        bonusRow("one", "bonus-2", { resetAt: NOW + 7_200_000 }),
+        bonusRow("two", "bonus-1", { resetAt: NOW + 1_800_000 }),
+      ],
+    });
+
+    expect(selected.connectionId).toBe("two");
+  });
+
+  // ── day bucketing ─────────────────────────────────────────────────────────
+  // Packs are grouped by the calendar day of their own resetAt, and one day's
+  // packs form a single budget: the account is ranked by "earliest expiry day,
+  // then credits still left on that day". Real CodeBuddy data routinely has
+  // several packs sharing one expiry day (e.g. 100 + 100 + 5 = 205).
+
+  const DAY_ONE = Date.parse("2026-07-11T00:00:00.000Z");
+  const DAY_TWO = Date.parse("2026-07-12T00:00:00.000Z");
+
+  it("bonus-first sums one day's packs and gives the biggest budget the first turn", async () => {
+    // "one" is the most recently used and has the highest token total, so plain
+    // round-robin would skip it; its three same-day packs add up to 205, which
+    // leads "two" (104) and "three" (50) on the same expiry day.
+    mocks.getProviderConnections.mockResolvedValue([
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 20_000).toISOString(), consecutiveUseCount: 1 },
+      { ...connection("three", 3, "codebuddy-cn"), lastUsedAt: new Date(NOW - 30_000).toISOString(), consecutiveUseCount: 1 },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+    mocks.getConnectionTokenTotals24h.mockResolvedValue(new Map([["one", 50_000], ["two", 100], ["three", 100]]));
+
+    const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+      now: NOW,
+      accountStrategy: "bonus-first",
+      quotaSnapshotsLoader: async () => [
+        bonusRow("one", "bonus-1", { remaining: 100, limit: 100, resetAt: DAY_ONE + 18 * 3_600_000 }),
+        bonusRow("one", "bonus-2", { remaining: 100, limit: 100, resetAt: DAY_ONE + 22 * 3_600_000 }),
+        bonusRow("one", "bonus-3", { remaining: 5, limit: 5, resetAt: DAY_ONE + 22 * 3_600_000 }),
+        bonusRow("two", "bonus-1", { remaining: 100, limit: 100, resetAt: DAY_ONE + 19 * 3_600_000 }),
+        bonusRow("two", "bonus-2", { remaining: 4, limit: 4, resetAt: DAY_ONE + 23 * 3_600_000 }),
+        bonusRow("three", "bonus-1", { remaining: 50, limit: 50, resetAt: DAY_ONE + 20 * 3_600_000 }),
+      ],
+    });
+
+    expect(selected.connectionId).toBe("one");
+  });
+
+  it("bonus-first rotates through the same-day cohort in credit order", async () => {
+    // The user-visible contract: three separate requests must land on A, B and C
+    // — one each — not all on A. A leads the day with 205 credits, B has 104 and
+    // C 50, so the cycle is A→B→C→A… The turn cursor (`consecutiveUseCount`) is
+    // the only state that survives between calls, hence the mutable store.
+    const cursors = { one: 0, two: 0, three: 0 };
+    mocks.getProviderConnections.mockImplementation(async () => [
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: null, consecutiveUseCount: cursors.one },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: null, consecutiveUseCount: cursors.two },
+      { ...connection("three", 3, "codebuddy-cn"), lastUsedAt: null, consecutiveUseCount: cursors.three },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+    mocks.updateProviderConnection.mockImplementation(async (id, patch) => {
+      if (patch.consecutiveUseCount !== undefined) cursors[id] = patch.consecutiveUseCount;
+      return { ...connection(id, 1, "codebuddy-cn"), ...patch };
+    });
+    const quotaSnapshotsLoader = async () => [
+      bonusRow("one", "bonus-1", { remaining: 100, limit: 100, resetAt: DAY_ONE + 18 * 3_600_000 }),
+      bonusRow("one", "bonus-2", { remaining: 100, limit: 100, resetAt: DAY_ONE + 22 * 3_600_000 }),
+      bonusRow("one", "bonus-3", { remaining: 5, limit: 5, resetAt: DAY_ONE + 22 * 3_600_000 }),
+      bonusRow("two", "bonus-1", { remaining: 100, limit: 100, resetAt: DAY_ONE + 19 * 3_600_000 }),
+      bonusRow("two", "bonus-2", { remaining: 4, limit: 4, resetAt: DAY_ONE + 23 * 3_600_000 }),
+      bonusRow("three", "bonus-1", { remaining: 50, limit: 50, resetAt: DAY_ONE + 20 * 3_600_000 }),
+    ];
+
+    const picks = [];
+    for (let call = 0; call < 4; call += 1) {
+      const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+        now: NOW,
+        accountStrategy: "bonus-first",
+        quotaSnapshotsLoader,
+      });
+      picks.push(selected.connectionId);
+    }
+
+    expect(picks).toEqual(["one", "two", "three", "one"]);
+  });
+
+  it("bonus-first drops a spent account out of the running day's rotation", async () => {
+    // Once "three" has burned its day-one credits nothing expires there any
+    // more, so the cohort shrinks to "one" and "two" and keeps rotating.
+    const cursors = { one: 0, two: 0, three: 0 };
+    let spent = false;
+    mocks.getProviderConnections.mockImplementation(async () => [
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: null, consecutiveUseCount: cursors.one },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: null, consecutiveUseCount: cursors.two },
+      { ...connection("three", 3, "codebuddy-cn"), lastUsedAt: null, consecutiveUseCount: cursors.three },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+    mocks.updateProviderConnection.mockImplementation(async (id, patch) => {
+      if (patch.consecutiveUseCount !== undefined) cursors[id] = patch.consecutiveUseCount;
+      return { ...connection(id, 1, "codebuddy-cn"), ...patch };
+    });
+    const quotaSnapshotsLoader = async () => [
+      bonusRow("one", "bonus-1", { remaining: 100, limit: 100, resetAt: DAY_ONE + 18 * 3_600_000 }),
+      bonusRow("two", "bonus-1", { remaining: 100, limit: 100, resetAt: DAY_ONE + 19 * 3_600_000 }),
+      bonusRow("three", "bonus-1", { remaining: spent ? 0 : 50, limit: 50, resetAt: DAY_ONE + 20 * 3_600_000 }),
+    ];
+
+    const picks = [];
+    for (let call = 0; call < 3; call += 1) {
+      const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+        now: NOW,
+        accountStrategy: "bonus-first",
+        quotaSnapshotsLoader,
+      });
+      picks.push(selected.connectionId);
+    }
+    spent = true;
+    for (let call = 0; call < 2; call += 1) {
+      const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+        now: NOW,
+        accountStrategy: "bonus-first",
+        quotaSnapshotsLoader,
+      });
+      picks.push(selected.connectionId);
+    }
+
+    expect(picks).toEqual(["one", "two", "three", "one", "two"]);
+  });
+
+  it("bonus-first hands over to the next expiry day once the current cohort is spent", async () => {
+    // The whole running day burns out, leaving only "one"'s later-day pack. The
+    // urgent cohort is now just "one", so every request must land there rather
+    // than falling back to a rotation that would let those credits lapse.
+    const cursors = { one: 0, two: 0, three: 0 };
+    let todaySpent = false;
+    mocks.getProviderConnections.mockImplementation(async () => [
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: null, consecutiveUseCount: cursors.one },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: null, consecutiveUseCount: cursors.two },
+      { ...connection("three", 3, "codebuddy-cn"), lastUsedAt: null, consecutiveUseCount: cursors.three },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+    mocks.updateProviderConnection.mockImplementation(async (id, patch) => {
+      if (patch.consecutiveUseCount !== undefined) cursors[id] = patch.consecutiveUseCount;
+      return { ...connection(id, 1, "codebuddy-cn"), ...patch };
+    });
+    const quotaSnapshotsLoader = async () => [
+      bonusRow("one", "bonus-1", { remaining: 900, limit: 900, resetAt: DAY_TWO + 3_600_000 }),
+      bonusRow("two", "bonus-1", { remaining: todaySpent ? 0 : 50, limit: 50, resetAt: DAY_ONE + 3_600_000 }),
+      bonusRow("three", "bonus-1", { remaining: todaySpent ? 0 : 40, limit: 40, resetAt: DAY_ONE + 2 * 3_600_000 }),
+    ];
+
+    const today = [];
+    for (let call = 0; call < 2; call += 1) {
+      const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+        now: NOW,
+        accountStrategy: "bonus-first",
+        quotaSnapshotsLoader,
+      });
+      today.push(selected.connectionId);
+    }
+    todaySpent = true;
+    const later = [];
+    for (let call = 0; call < 2; call += 1) {
+      const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+        now: NOW,
+        accountStrategy: "bonus-first",
+        quotaSnapshotsLoader,
+      });
+      later.push(selected.connectionId);
+    }
+
+    expect(today).toEqual(["two", "three"]);
+    expect(later).toEqual(["one", "one"]);
+  });
+
+  it("bonus-first leaves the rotation when only recurring refills remain", async () => {
+    // No one-shot pack holds credits anywhere, so nothing can lapse and the
+    // credit rotation has no ordering to apply: the established round-robin
+    // order (LRU) must take over instead of collapsing onto one account.
+    const lastUsed = { one: null, two: null, three: null };
+    mocks.getProviderConnections.mockImplementation(async () => [
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: lastUsed.one, consecutiveUseCount: 1 },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: lastUsed.two, consecutiveUseCount: 1 },
+      { ...connection("three", 3, "codebuddy-cn"), lastUsedAt: lastUsed.three, consecutiveUseCount: 1 },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+    mocks.updateProviderConnection.mockImplementation(async (id, patch) => {
+      if (patch.lastUsedAt !== undefined) lastUsed[id] = patch.lastUsedAt;
+      return { ...connection(id, 1, "codebuddy-cn"), ...patch };
+    });
+    const quotaSnapshotsLoader = async () => [
+      bonusRow("one", "monthly", { remaining: 500, limit: 500, resetAt: DAY_TWO + 3_600_000, recurring: true }),
+      bonusRow("two", "monthly", { remaining: 500, limit: 500, resetAt: DAY_TWO + 3_600_000, recurring: true }),
+      bonusRow("three", "monthly", { remaining: 500, limit: 500, resetAt: DAY_TWO + 3_600_000, recurring: true }),
+    ];
+
+    const picks = [];
+    for (let call = 0; call < 3; call += 1) {
+      const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+        now: NOW,
+        accountStrategy: "bonus-first",
+        quotaSnapshotsLoader,
+      });
+      picks.push(selected.connectionId);
+    }
+
+    expect(picks).toEqual(["one", "two", "three"]);
+  });
+
+  it("bonus-first prefers an earlier expiry day over a bigger later budget", async () => {
+    // "one" holds 900 credits but they do not vanish until the next day; "two"
+    // holds only 10 and they expire today, so "two" must go first.
+    mocks.getProviderConnections.mockResolvedValue([
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+
+    const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+      now: NOW,
+      accountStrategy: "bonus-first",
+      quotaSnapshotsLoader: async () => [
+        bonusRow("one", "bonus-1", { remaining: 900, limit: 900, resetAt: DAY_TWO + 3_600_000 }),
+        bonusRow("two", "bonus-1", { remaining: 10, limit: 10, resetAt: DAY_ONE + 3_600_000 }),
+      ],
+    });
+
+    expect(selected.connectionId).toBe("two");
+  });
+
+  it("bonus-first cuts affinity once the pinned account's day has passed", async () => {
+    // Call 1: "three" holds the only today-expiring budget, so the session pins
+    // to it. Call 2: those credits are gone and "three" now only has a later
+    // day, while "one" holds today's budget — the session must move to "one"
+    // rather than stay pinned and let today's credits lapse.
+    mocks.getProviderConnections.mockResolvedValue([
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 30_000).toISOString(), consecutiveUseCount: 1 },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 20_000).toISOString(), consecutiveUseCount: 1 },
+      { ...connection("three", 3, "codebuddy-cn"), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+
+    let round = 0;
+    const quotaSnapshotsLoader = async () => {
+      round += 1;
+      if (round === 1) {
+        return [
+          bonusRow("one", "bonus-1", { remaining: 100, limit: 100, resetAt: DAY_TWO + 3_600_000 }),
+          bonusRow("two", "bonus-1", { remaining: 90, limit: 90, resetAt: DAY_TWO + 3_600_000 }),
+          bonusRow("three", "bonus-1", { remaining: 50, limit: 50, resetAt: DAY_ONE + 3_600_000 }),
+        ];
+      }
+      return [
+        bonusRow("one", "bonus-1", { remaining: 100, limit: 100, resetAt: DAY_ONE + 20 * 3_600_000 }),
+        bonusRow("two", "bonus-1", { remaining: 90, limit: 90, resetAt: DAY_TWO + 3_600_000 }),
+        // "three"'s day-one pack is spent: nothing left that expires today.
+        bonusRow("three", "bonus-1", { remaining: 0, limit: 50, resetAt: DAY_ONE + 3_600_000 }),
+        bonusRow("three", "bonus-2", { remaining: 40, limit: 40, resetAt: DAY_TWO + 3_600_000 }),
+      ];
+    };
+
+    const first = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+      now: NOW,
+      accountStrategy: "bonus-first",
+      sessionId: "sess-day-cut",
+      quotaSnapshotsLoader,
+    });
+    const second = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+      now: NOW,
+      accountStrategy: "bonus-first",
+      sessionId: "sess-day-cut",
+      quotaSnapshotsLoader,
+    });
+
+    expect(first.connectionId).toBe("three");
+    expect(second.connectionId).toBe("one");
+  });
+
+  it("bonus-first keeps affinity while the pinned account still holds today's budget", async () => {
+    // Call 1: only "three" holds a today-expiring budget, so the session pins to
+    // it. Call 2: "one" now holds MORE credits on the same day (100 vs 50), so
+    // the rotation order alone would move the session to "one". Affinity must
+    // still win, because "three" can lose its own credits today just as well.
+    mocks.getProviderConnections.mockResolvedValue([
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 30_000).toISOString(), consecutiveUseCount: 1 },
+      { ...connection("three", 3, "codebuddy-cn"), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+
+    let round = 0;
+    const quotaSnapshotsLoader = async () => {
+      round += 1;
+      return [
+        // "one" only joins the current day on call 2, with the larger budget.
+        bonusRow("one", "bonus-1", {
+          remaining: round === 1 ? 100 : 100,
+          limit: 100,
+          resetAt: round === 1 ? DAY_TWO + 3_600_000 : DAY_ONE + 20 * 3_600_000,
+        }),
+        bonusRow("three", "bonus-1", { remaining: 50, limit: 50, resetAt: DAY_ONE + 3_600_000 }),
+      ];
+    };
+
+    const first = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+      now: NOW,
+      accountStrategy: "bonus-first",
+      sessionId: "sess-day-keep",
+      quotaSnapshotsLoader,
+    });
+    const second = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+      now: NOW,
+      accountStrategy: "bonus-first",
+      sessionId: "sess-day-keep",
+      quotaSnapshotsLoader,
+    });
+
+    expect(first.connectionId).toBe("three");
+    // Ranking alone would pick "one" (100 > 50 on the same day); affinity holds.
+    expect(second.connectionId).toBe("three");
+  });
+
+  it("bonus-first ignores a recurring refill refresh in favour of a bonus pack", async () => {
+    mocks.getProviderConnections.mockResolvedValue([
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+
+    const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+      now: NOW,
+      accountStrategy: "bonus-first",
+      quotaSnapshotsLoader: async () => [
+        bonusRow("one", "monthly", { resetAt: NOW + 60_000, recurring: true }),
+        bonusRow("two", "bonus-1", { resetAt: NOW + 86_400_000 }),
+      ],
+    });
+
+    expect(selected.connectionId).toBe("two");
+  });
+
+  it("bonus-first falls back to round-robin order when only refills expire", async () => {
+    mocks.getProviderConnections.mockResolvedValue([
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+
+    const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+      now: NOW,
+      accountStrategy: "bonus-first",
+      // No one-shot pack anywhere: the soonest resetAt belongs to a refill that
+      // merely refreshes, so the plain LRU round-robin order decides.
+      quotaSnapshotsLoader: async () => [
+        bonusRow("one", "monthly", { resetAt: NOW + 3_600_000, recurring: true }),
+        bonusRow("two", "monthly", { resetAt: NOW + 600_000, recurring: true }),
+      ],
+    });
+
+    expect(selected.connectionId).toBe("one");
+  });
+
+  it("bonus-first treats a whole-second expiry gap as a tie and keeps round-robin order", async () => {
+    mocks.getProviderConnections.mockResolvedValue([
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+
+    const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+      now: NOW,
+      accountStrategy: "bonus-first",
+      // "one" expires 999ms later — inside the one-second tie window.
+      quotaSnapshotsLoader: async () => [
+        bonusRow("one", "bonus-1", { resetAt: NOW + 3_600_999 }),
+        bonusRow("two", "bonus-1", { resetAt: NOW + 3_600_000 }),
+      ],
+    });
+
+    expect(selected.connectionId).toBe("one");
+  });
+
+  it("bonus-first keeps session affinity ahead of expiry order", async () => {
+    mocks.getProviderConnections.mockResolvedValue([
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+    const quotaSnapshotsLoader = async () => [
+      bonusRow("one", "bonus-1", { resetAt: NOW + 86_400_000 }),
+      bonusRow("two", "bonus-1", { resetAt: NOW + 3_600_000 }),
+    ];
+
+    const first = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+      now: NOW,
+      accountStrategy: "bonus-first",
+      sessionId: "sess-bonus-affinity",
+      quotaSnapshotsLoader,
+    });
+    const second = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+      now: NOW,
+      accountStrategy: "bonus-first",
+      sessionId: "sess-bonus-affinity",
+      quotaSnapshotsLoader,
+    });
+
+    expect(first.connectionId).toBe("two");
+    expect(second.connectionId).toBe("two");
+  });
+
+  it("keeps the configured strategy when no per-request account strategy is supplied", async () => {
+    mocks.getProviderConnections.mockResolvedValue([
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "fill-first" });
+
+    const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+      now: NOW,
+      quotaSnapshotsLoader: async () => [
+        bonusRow("one", "bonus-1", { resetAt: NOW + 86_400_000 }),
+        bonusRow("two", "bonus-1", { resetAt: NOW + 3_600_000 }),
+      ],
+    });
+
+    expect(selected.connectionId).toBe("one");
+  });
+
   it("codebuddy-cn balances round-robin by the rolling-24h token total", async () => {
     // "two" is the most recently used account, but "one" has burned far fewer
     // tokens today, so the new session must land on "one".

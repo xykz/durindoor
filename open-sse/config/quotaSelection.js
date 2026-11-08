@@ -11,6 +11,13 @@ export const QUOTA_SELECTION_DEFAULTS = Object.freeze({
   routingFloorRatio: 0.02,
   lowRatio: 0.20,
   routingFloorEpsilon: 1e-9,
+  // Within one expiry day, two one-shot credit pools whose expiries differ by
+  // at most this many milliseconds are treated as expiring together, so
+  // `bonus-first` rotation falls back to the normal round-robin order instead
+  // of chasing sub-second provider clock noise. Provider reset times are
+  // reported at whole seconds. Day boundaries themselves are compared at date
+  // precision, so this tolerance never moves a pool into another day.
+  bonusExpiryTieMs: 1000,
   starvationMs: 5 * 60 * 1000,
   heartbeatMs: 30 * 1000,
   leaseMs: Math.max(
