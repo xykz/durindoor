@@ -391,4 +391,39 @@ describe("connection pinning", () => {
       expect.objectContaining({ accountStrategy: null }),
     );
   });
+
+  it("parses x-account-concurrency and forwards it to the dispatcher", async () => {
+    await handleChat(request({}, { headers: { "x-account-concurrency": "3" } }));
+    expect(mocks.handleChatCore).toHaveBeenCalledWith(
+      expect.objectContaining({ accountConcurrencyLimit: 3 }),
+    );
+  });
+
+  it("normalizes the account concurrency header before forwarding", async () => {
+    await handleChat(request({}, { headers: { "x-account-concurrency": "  5  " } }));
+    expect(mocks.handleChatCore).toHaveBeenCalledWith(
+      expect.objectContaining({ accountConcurrencyLimit: 5 }),
+    );
+  });
+
+  it("clamps an oversized account concurrency header", async () => {
+    await handleChat(request({}, { headers: { "x-account-concurrency": "999" } }));
+    expect(mocks.handleChatCore).toHaveBeenCalledWith(
+      expect.objectContaining({ accountConcurrencyLimit: 64 }),
+    );
+  });
+
+  it("leaves the account concurrency unset for a malformed header", async () => {
+    await handleChat(request({}, { headers: { "x-account-concurrency": "lots" } }));
+    expect(mocks.handleChatCore).toHaveBeenCalledWith(
+      expect.objectContaining({ accountConcurrencyLimit: 0 }),
+    );
+  });
+
+  it("leaves the account concurrency unset when the header is absent", async () => {
+    await handleChat(request({}));
+    expect(mocks.handleChatCore).toHaveBeenCalledWith(
+      expect.objectContaining({ accountConcurrencyLimit: 0 }),
+    );
+  });
 });

@@ -17,6 +17,7 @@ import { handleBypassRequest } from "../utils/bypassHandler.js";
 import { handlePonytailCommands, DEFAULT_PONYTAIL_HELP, resolvePonytailStream } from "../utils/tokenSaverBridge.js";
 import { trackPendingRequest, finishActiveSession, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
 import { acquireSlot, releaseSlot, getConcurrencyLimit, ConcurrencyGateTimeoutError } from "../services/concurrencyGate.js";
+import { resolveConcurrencyGate } from "@/shared/utils/accountConcurrency.js";
 import {
   runWithProviderAttemptContext,
   settleProviderAttemptDispatch } from
@@ -271,8 +272,13 @@ async function cancelResponseBody(response) {
  *   for INFO lines, and `errorLine(tag, symbol, message)` for always-printed
  *   errors. Legacy `info`/`debug`/`warn`/`error` remain supported.
  * @param {string} options.sourceFormatOverride - Override detected source format (e.g. "openai-responses")
+ * @param {number} [options.accountConcurrencyLimit] - Per-account in-flight
+ *   ceiling for this request (from `x-account-concurrency`). When positive the
+ *   concurrency gate is keyed `${provider}:${connectionId}` and supersedes the
+ *   provider-wide limit; when absent or non-positive the provider-wide gate
+ *   applies unchanged. See `@/shared/utils/accountConcurrency.js`.
  */
-export async function handleChatCore({ body, modelInfo, credentials: rawCredentials, log, refreshCredentials, onCredentialsRefreshed, onRequestSuccess, onEmptyStream, onProviderAttempt, quotaReservation = null, abortSignal = null, onDisconnect, onUpstreamEmptyExhausted, clientRawRequest, connectionId, userAgent, apiKey, apiKeyName = "Local (No API Key)", ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, pxpipeAllowedModels, onPxpipeEvent, onHeadroomEvent, onTokenSaverEvent, sourceFormatOverride, providerThinking, providerConcurrencyLimit, compressionEnabled, compressionEngines, skipPonytailCommands = false, claudeClassifierCompat, modelCapabilities = null }) {
+export async function handleChatCore({ body, modelInfo, credentials: rawCredentials, log, refreshCredentials, onCredentialsRefreshed, onRequestSuccess, onEmptyStream, onProviderAttempt, quotaReservation = null, abortSignal = null, onDisconnect, onUpstreamEmptyExhausted, clientRawRequest, connectionId, userAgent, apiKey, apiKeyName = "Local (No API Key)", ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, pxpipeAllowedModels, onPxpipeEvent, onHeadroomEvent, onTokenSaverEvent, sourceFormatOverride, providerThinking, providerConcurrencyLimit, accountConcurrencyLimit = 0, compressionEnabled, compressionEngines, skipPonytailCommands = false, claudeClassifierCompat, modelCapabilities = null }) {
   const credentials = rawCredentials ?
   {
     ...rawCredentials,
@@ -921,8 +927,21 @@ export async function handleChatCore({ body, modelInfo, credentials: rawCredenti
   const msgCount = translatedBody.messages?.length || translatedBody.input?.length || translatedBody.contents?.length || translatedBody.request?.contents?.length || 0;
   log?.debug?.("REQUEST", `${provider.toUpperCase()} | ${cleanModel} | ${msgCount} msgs`);
 
-  // --- Per-provider concurrency gate (declaration before streamController closures) ---
-  const concurrencyLimit = getConcurrencyLimit(provider, providerConcurrencyLimit);
+  // --- Concurrency gate (declaration before streamController closures) ---
+  // The account-level gate is keyed by `${provider}:${connectionId}` and, when
+  // requested, REPLACES the provider-wide gate for this request: chaining both
+  // would clamp the pool to the provider value and make the account limit
+  // unreachable. Without the header the provider-wide gate behaves as before.
+  const gate = resolveConcurrencyGate({
+    provider,
+    connectionId: connectionId || credentials?.connectionId || null,
+    providerConcurrencyLimit,
+    accountConcurrencyLimit,
+    providerLimitOf: getConcurrencyLimit
+  });
+  const concurrencyLimit = gate.limit;
+  const concurrencyGateKey = gate.key;
+  const concurrencyScope = gate.scope;
   let slotAcquired = false;
   let providerRequestFinished = false;
   let activeSessionFinished = false;
@@ -936,7 +955,7 @@ export async function handleChatCore({ body, modelInfo, credentials: rawCredenti
     providerRequestFinished = true;
     trackPendingRequest(cleanModel, provider, connectionId, false, false, { requestId: activeSessionRequestId }, apiKeyName);
     if (slotAcquired) {
-      releaseSlot(provider);
+      releaseSlot(concurrencyGateKey);
       slotAcquired = false;
     }
   };
@@ -1107,20 +1126,22 @@ export async function handleChatCore({ body, modelInfo, credentials: rawCredenti
     }
   };
 
-  // --- Per-provider concurrency gate ---
+  // --- Concurrency gate ---
   // Acquire a slot before sending the upstream request.  This proactively
-  // limits concurrent in-flight requests per provider, preventing 429s before
-  // they happen.  If the slot can't be acquired within the timeout, return 503.
+  // limits concurrent in-flight requests, preventing 429s before they happen.
+  // The key is the provider (default) or one account's composite key when the
+  // caller supplied `x-account-concurrency`.  If the slot can't be acquired
+  // within the timeout, return 503.
   if (concurrencyLimit > 0) {
     try {
-      await acquireSlot(provider, concurrencyLimit, undefined, providerSignal);
+      await acquireSlot(concurrencyGateKey, concurrencyLimit, undefined, providerSignal);
       slotAcquired = true;
-      log?.debug?.("CONCURRENCY", `${provider} | slot acquired (${concurrencyLimit} max)`);
+      log?.debug?.("CONCURRENCY", `${concurrencyGateKey} | slot acquired (${concurrencyLimit} max, ${concurrencyScope})`);
     } catch (e) {
       finishProviderRequest();
       finishActiveDashboardSession("error");
       if (e instanceof ConcurrencyGateTimeoutError) {
-        log?.warn?.("CONCURRENCY", `${provider} | gate timeout after ${e.timeoutMs}ms (${e.limit} max)`);
+        log?.warn?.("CONCURRENCY", `${concurrencyGateKey} | gate timeout after ${e.timeoutMs}ms (${e.limit} max)`);
         finishTimeline("error", "error", "concurrency gate timeout");
         return createErrorResult(HTTP_STATUS.SERVICE_UNAVAILABLE, e.message);
       }

@@ -43,6 +43,7 @@ import { isAntigravityCapacityError, isRequestReplayBufferError } from "open-sse
 import { resolveClientSessionId, parseSessionAffinityTtl } from "open-sse/utils/sessionManager.js";
 import { parseTokenBudget } from "@/shared/utils/tokenBudget.js";
 import { parseAccountStrategy } from "@/shared/utils/accountStrategy.js";
+import { parseAccountConcurrency } from "@/shared/utils/accountConcurrency.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials } from "../services/tokenRefresh.js";
 import { refreshAndUpdateCredentials } from "@/shared/services/providerCredentials";
@@ -871,6 +872,14 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     clientRawRequest?.headers?.["x-account-strategy"]
   );
 
+  // Per-request per-account concurrency cap. `x-account-concurrency: 3` gates
+  // the selected account itself (upstream throttles per account, not per
+  // provider) and supersedes the provider-wide `Max Concurrent` for this
+  // request; missing or malformed keeps today's provider-wide behaviour.
+  const accountConcurrencyLimit = parseAccountConcurrency(
+    clientRawRequest?.headers?.["x-account-concurrency"]
+  );
+
   // Resolve request-scoped custom capabilities once, just before the retry loop.
   // Custom model aliases are stored by provider prefix; requestPrefix carries
   // the prefix the caller actually used (e.g. node alias or bare model alias).
@@ -1109,6 +1118,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         },
         providerThinking,
         providerConcurrencyLimit: chatSettings.providerConcurrencyLimits,
+        accountConcurrencyLimit: accountConcurrencyLimit || 0,
         claudeClassifierCompat: ["off", "auto", "always"].includes(chatSettings.claudeClassifierCompat) ?
         chatSettings.claudeClassifierCompat :
         "off",

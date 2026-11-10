@@ -61,11 +61,25 @@ For round-robin providers, behavior depends on whether a stable client session i
 
 Generated connection sessions and assistant-anchored conversation sessions are also bounded in memory. Reads refresh their recency, so reaching the 1,000-connection or 5,000-conversation safety cap evicts the least-recently-used entry rather than rotating an active session and losing its warm prompt cache.
 
-Three per-request headers tune account selection:
+Four per-request headers tune account selection:
 
 - `x-connection-id` accepts either one connection id (a hard pin: the request fails rather than rotating if that account is unavailable) or a comma-separated list (a candidate pool: selection still round-robins within the pool, and a member failure rotates to the next pool member; if no pool member is available the request fails rather than falling back outside the pool).
 - `x-session-affinity-ttl` overrides the session-affinity TTL for that request. A bare number is seconds (`600`), explicit units are honored (`500ms`, `30s`, `10m`, `1h`), and `off`/`none`/`disabled`/`0` disables affinity so the request re-balances immediately. Missing or malformed values keep the default. Expiry stays sliding: an active session keeps refreshing its entry.
 - `x-account-strategy` overrides the stored `fallbackStrategy` for one request without changing any dashboard setting. `bonus-first` selects the round-robin variant described below; any other value (including blank) is ignored and the configured strategy stays in effect. A hard `x-connection-id` pin still outranks it.
+- `x-account-concurrency` sets a **per-account** in-flight ceiling for that request instead of the provider-wide one. A bare positive integer is required (`3`); blank, zero, negative, fractional, or non-numeric values are ignored. Values above `MAX_ACCOUNT_CONCURRENCY` (64) are clamped. When present it *supersedes* the provider's `Max Concurrent` setting rather than stacking with it — see the account concurrency section below.
+
+### Account-level concurrency
+
+`Max Concurrent` in a provider's dashboard settings is **provider-wide**: `3` means the whole provider admits three concurrent upstream requests, shared by every account. That is the wrong dimension for providers whose upstream limit applies per account — CodeBuddy CN, for example, tolerates a few concurrent requests *per account*, so a provider-wide cap of 3 under-uses a pool of eight accounts while a cap large enough to use them all over-drives whichever account the strategy prefers. `bonus-first` makes that worse on purpose: it concentrates traffic on the earliest-expiring cohort.
+
+`x-account-concurrency: N` moves the ceiling to the selected account. The concurrency gate is then keyed `${provider}:${connectionId}` instead of just `${provider}`, so each account gets its own semaphore and two accounts can be in flight simultaneously. The slot is released under the same composite key it was acquired with — releasing the bare provider key would leave the account's slot occupied and eventually wedge the account permanently.
+
+Precedence and fallback:
+
+- The header wins over the provider's `Max Concurrent` for that request. Without this the provider-wide semaphore would still clamp the pool, so the header would change nothing.
+- Without the header, behaviour is exactly as before: the provider-wide gate applies, or nothing does when no `Max Concurrent` is configured.
+- The header needs a resolvable connection id. If selection produced none, the provider-wide gate applies instead of an unbounded account gate.
+- Routing-worker and retry paths inherit the same option, so every attempt of a request uses the account gate of the account it is dispatched to.
 
 ### CodeBuddy CN token budget
 
