@@ -793,8 +793,29 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       return earliest === null || day < earliest ? day : earliest;
     }, null) :
     null;
+    // "No observation" is not "expires later". `quotaProfile` is null whenever
+    // the account's snapshots are stale or missing, and the quota preflight only
+    // refreshes the account it already selected — so once one account is warm
+    // the others age out within `PROVIDER_QUOTA_DEFAULTS.freshnessMs` (60s) and
+    // drop every window. Filtering the cohort to accounts with a KNOWN earlier
+    // day then left a cohort of one, and that single account absorbed all the
+    // traffic while its own packs expired in two days and the others' in one.
+    // Accounts never observed therefore stay in the cycle, ordered last: they
+    // take the later turns of every rotation without pre-empting a known urgent
+    // day, and selecting them refreshes their snapshots. An account that WAS
+    // observed and simply holds nothing usable is a different case — it is spent
+    // or refill-only, so it is left out rather than given a turn. Its snapshots
+    // still carry `freshness: "fresh"`, which is how the two cases are told
+    // apart; once they age out it looks unknown again and gets re-probed, which
+    // costs a request that the recurring pool still serves.
+    const unknownConnections = bonusFirst && urgentDay !== null ?
+    availableConnections.filter((candidate) =>
+    bucketOfId(candidate.id) === null && quotaDecisions.get(candidate.id)?.freshness !== "fresh") :
+    [];
     const urgentConnections = bonusFirst && urgentDay !== null ?
-    availableConnections.filter((candidate) => bucketOfId(candidate.id)?.day === urgentDay) :
+    [
+      ...availableConnections.filter((candidate) => bucketOfId(candidate.id)?.day === urgentDay),
+      ...unknownConnections] :
     availableConnections;
     // Rotation order for the urgent cohort: biggest same-day budget first, then
     // exact expiry instant, then the caller's stable order. `Array.prototype.sort`

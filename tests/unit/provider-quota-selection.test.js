@@ -298,7 +298,7 @@ describe("quota-aware provider selection", () => {
   // old snapshot refreshes, which is both wasteful and a single-account rate
   // limit risk, so the order is walked round-robin instead.
 
-  function bonusRow(connectionId, name, { remaining = 10, limit = 10, resetAt, recurring = false } = {}) {
+  function bonusRow(connectionId, name, { remaining = 10, limit = 10, resetAt, recurring = false, ageMs = 1000 } = {}) {
     return {
       identity: {
         connectionId,
@@ -317,8 +317,8 @@ describe("quota-aware provider selection", () => {
         unit: "credits",
       },
       timing: {
-        observedAt: new Date(NOW - 1000).toISOString(),
-        staleAt: new Date(NOW + 60_000).toISOString(),
+        observedAt: new Date(NOW - ageMs).toISOString(),
+        staleAt: new Date(NOW - ageMs + 60_000).toISOString(),
         resetAt: resetAt === undefined ? null : new Date(resetAt).toISOString(),
         cooldownUntil: null,
       },
@@ -536,6 +536,123 @@ describe("quota-aware provider selection", () => {
 
     expect(today).toEqual(["two", "three"]);
     expect(later).toEqual(["one", "one"]);
+  });
+
+  it("bonus-first keeps an account whose quota is unreadable in the rotation", async () => {
+    // Regression: the quota preflight refreshes only the account it selected, so
+    // the others age past staleAt (60s) and report no profile at all. Treating
+    // "no observation" as "expires later" dropped them from the cohort, left a
+    // cohort of one, and pinned every request to the warm account even though
+    // its own packs expired two days out while "two" and "three" expired
+    // tomorrow. Unknown accounts must stay in the cycle, ordered last.
+    const cursors = { one: 0, two: 0, three: 0 };
+    mocks.getProviderConnections.mockImplementation(async () => [
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: null, consecutiveUseCount: cursors.one },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: null, consecutiveUseCount: cursors.two },
+      { ...connection("three", 3, "codebuddy-cn"), lastUsedAt: null, consecutiveUseCount: cursors.three },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+    mocks.updateProviderConnection.mockImplementation(async (id, patch) => {
+      if (patch.consecutiveUseCount !== undefined) cursors[id] = patch.consecutiveUseCount;
+      return { ...connection(id, 1, "codebuddy-cn"), ...patch };
+    });
+    const stale = 3_600_000;
+    const quotaSnapshotsLoader = async () => [
+      // Only "one" was ever refreshed; it is the least urgent of the three.
+      bonusRow("one", "bonus-1", { remaining: 100, limit: 100, resetAt: DAY_TWO + 3_600_000, ageMs: 5_000 }),
+      bonusRow("two", "bonus-1", { remaining: 90, limit: 90, resetAt: DAY_ONE + 4_000_000, ageMs: stale }),
+      bonusRow("three", "bonus-1", { remaining: 80, limit: 80, resetAt: DAY_ONE + 5_000_000, ageMs: stale }),
+    ];
+
+    const picks = [];
+    for (let call = 0; call < 4; call += 1) {
+      const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+        now: NOW,
+        accountStrategy: "bonus-first",
+        quotaSnapshotsLoader,
+      });
+      picks.push(selected.connectionId);
+    }
+
+    // Previously ["one","one","one","one"].
+    expect(picks).toEqual(["one", "two", "three", "one"]);
+  });
+
+  it("bonus-first gives an unobserved account a turn that refreshes its quota", async () => {
+    // Same failure mode at its root: at first only ONE account has snapshots at
+    // all. The unobserved accounts must still be selectable, both to spread load
+    // and because selecting one is what triggers its quota refresh.
+    const cursors = { one: 0, two: 0, three: 0 };
+    const observed = new Set();
+    mocks.getProviderConnections.mockImplementation(async () => [
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: null, consecutiveUseCount: cursors.one },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: null, consecutiveUseCount: cursors.two },
+      { ...connection("three", 3, "codebuddy-cn"), lastUsedAt: null, consecutiveUseCount: cursors.three },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+    mocks.updateProviderConnection.mockImplementation(async (id, patch) => {
+      if (patch.consecutiveUseCount !== undefined) cursors[id] = patch.consecutiveUseCount;
+      return { ...connection(id, 1, "codebuddy-cn"), ...patch };
+    });
+    const packs = {
+      one: { remaining: 100, limit: 100, resetAt: DAY_TWO + 3_600_000 },
+      two: { remaining: 90, limit: 90, resetAt: DAY_ONE + 4_000_000 },
+      three: { remaining: 80, limit: 80, resetAt: DAY_ONE + 5_000_000 },
+    };
+    const quotaSnapshotsLoader = async () => Object.entries(packs).
+    filter(([id]) => observed.has(id)).
+    map(([id, pack]) => bonusRow(id, "bonus-1", pack));
+
+    const picks = [];
+    for (let call = 0; call < 4; call += 1) {
+      const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+        now: NOW,
+        accountStrategy: "bonus-first",
+        quotaSnapshotsLoader,
+      });
+      picks.push(selected.connectionId);
+      observed.add(selected.connectionId);
+    }
+
+    // Previously ["one","one","one","one"].
+    expect(picks.slice(0, 3)).toEqual(["one", "two", "three"]);
+    expect(new Set(picks).size).toBe(3);
+  });
+
+  it("bonus-first leaves a spent account out even when other quotas are stale", async () => {
+    // The unreadable-account rule must not resurrect genuinely spent accounts:
+    // "three" WAS observed and holds nothing usable, so it stays out of the
+    // rotation instead of being handed a turn as if its quota were unknown.
+    const cursors = { one: 0, two: 0, three: 0 };
+    mocks.getProviderConnections.mockImplementation(async () => [
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: null, consecutiveUseCount: cursors.one },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: null, consecutiveUseCount: cursors.two },
+      { ...connection("three", 3, "codebuddy-cn"), lastUsedAt: null, consecutiveUseCount: cursors.three },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+    mocks.updateProviderConnection.mockImplementation(async (id, patch) => {
+      if (patch.consecutiveUseCount !== undefined) cursors[id] = patch.consecutiveUseCount;
+      return { ...connection(id, 1, "codebuddy-cn"), ...patch };
+    });
+    const quotaSnapshotsLoader = async () => [
+      bonusRow("one", "bonus-1", { remaining: 100, limit: 100, resetAt: DAY_ONE + 18 * 3_600_000 }),
+      // "three" was observed and its pack is empty, so it is genuinely spent.
+      bonusRow("three", "bonus-1", { remaining: 0, limit: 50, resetAt: DAY_ONE + 20 * 3_600_000 }),
+      // "two" is stale throughout: unreadable, not spent, so it keeps its turns.
+      bonusRow("two", "bonus-1", { remaining: 90, limit: 90, resetAt: DAY_ONE + 19 * 3_600_000, ageMs: 3_600_000 }),
+    ];
+
+    const picks = [];
+    for (let call = 0; call < 4; call += 1) {
+      const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+        now: NOW,
+        accountStrategy: "bonus-first",
+        quotaSnapshotsLoader,
+      });
+      picks.push(selected.connectionId);
+    }
+
+    expect(picks).toEqual(["one", "two", "one", "two"]);
   });
 
   it("bonus-first leaves the rotation when only recurring refills remain", async () => {
