@@ -276,6 +276,33 @@ function quotaProfileForGate(result, gate, now) {
   };
 }
 
+/**
+ * Windows from observations that are real but past their freshness deadline.
+ *
+ * These never enter `quotaProfile`: routing floors read `routingWindows[].ratio`
+ * and a stale low ratio would trip the local 503 floor, and `scoreQuotaCandidate`
+ * only ranks fresh profiles. They are published separately so `bonus-first` can
+ * still order accounts by expiry when every snapshot in the pool has aged out,
+ * instead of falling back to the token/recency order that ignores credits
+ * entirely. Only `bonus-first` consumes this field (via `bonusBucketOf` in
+ * `@/shared/services/quotaSelection`).
+ *
+ * @param {Array<{selected: Array<object>}>} gateResults - Per-gate selections.
+ * @param {number} now - Reference clock.
+ * @returns {Array<object>} Stale routing windows, empty when nothing aged out.
+ */
+function staleRoutingWindowsForGates(gateResults, now) {
+  const byIdentity = new Map();
+  for (const row of gateResults.flatMap((result) => result.selected || [])) {
+    if (!DEFINITIVE_STATES.has(row.state) || isFresh(row, now)) continue;
+    const window = routingWindow(row);
+    // A row can satisfy several gates; keep one window per pool so a day's
+    // credit total is not counted twice.
+    if (window) byIdentity.set(`${window.resourceKey}|${window.dimensionKey}`, window);
+  }
+  return [...byIdentity.values()];
+}
+
 function evaluateGate(rows, gate, exactResources, now, { connectionWide = false } = {}) {
   const selectors = (gate?.selectors || []).filter(
     (selector) => !(connectionWide && selector.resource === "requested")
@@ -418,6 +445,10 @@ export function evaluateProviderQuotaPreflight(snapshots = [], {
   const gateResults = (config?.preflightPolicy?.gates || []).map((gate) =>
   evaluateGate(providerRows, gate, exactResources, safeNow, { connectionWide })
   );
+  // Computed once and attached to the fail-open decisions below: when every
+  // observation is stale `quotaProfile` is null, so `bonus-first` has nothing to
+  // order by unless the aged-out windows are published alongside it.
+  const staleWindows = staleRoutingWindowsForGates(gateResults, safeNow);
   const blocking = gateResults.map((result) => result.decision).filter((decision) => decision?.skip);
   if (blocking.length > 0) {
     const rows = blocking.map((decision) => ({
@@ -465,7 +496,7 @@ export function evaluateProviderQuotaPreflight(snapshots = [], {
         reason: combined.reason === "low" || current.reason === "low" ? "low" : "available"
       };
     }, null);
-    return { ...decision, quotaProfile: profile };
+    return { ...decision, quotaProfile: profile, staleRoutingWindows: staleWindows };
   }
 
   if (trackerError) {
@@ -476,11 +507,17 @@ export function evaluateProviderQuotaPreflight(snapshots = [], {
   const staleDecision = decisive.find((decision) => decision.reason === "tracker_error") ||
   decisive.find((decision) => decision.reason === "unknown") ||
   decisive.find((decision) => decision.reason === "stale");
-  if (staleDecision) return { ...staleDecision, shouldRefresh: refreshSupported };
+  if (staleDecision) return { ...staleDecision, shouldRefresh: refreshSupported, staleRoutingWindows: staleWindows };
   if (runtimeRows.length > 0 || hasConfiguredRows) {
-    return { ...MISSING_DECISION, reason: "stale", freshness: "stale", shouldRefresh: refreshSupported };
+    return {
+      ...MISSING_DECISION,
+      reason: "stale",
+      freshness: "stale",
+      shouldRefresh: refreshSupported,
+      staleRoutingWindows: staleWindows
+    };
   }
-  return { ...MISSING_DECISION, shouldRefresh: refreshSupported };
+  return { ...MISSING_DECISION, shouldRefresh: refreshSupported, staleRoutingWindows: staleWindows };
 }
 
 /** Load persisted observations once and return safe decisions for candidates. */

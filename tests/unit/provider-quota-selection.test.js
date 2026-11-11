@@ -574,8 +574,12 @@ describe("quota-aware provider selection", () => {
       picks.push(selected.connectionId);
     }
 
-    // Previously ["one","one","one","one"].
-    expect(picks).toEqual(["one", "two", "three", "one"]);
+    // Previously ["one","one","one","one"], later ["one","two","three","one"]
+    // while stale accounts ranked last. With the optimistic stale ordering the
+    // expiry DAY wins even when only the aged-out windows are available:
+    // "two"/"three" still expire on DAY_ONE while the warm "one" expires on
+    // DAY_TWO, so the urgent pair takes the rotation and the warm account waits.
+    expect(picks).toEqual(["two", "three", "two", "three"]);
   });
 
   it("bonus-first gives an unobserved account a turn that refreshes its quota", async () => {
@@ -617,6 +621,48 @@ describe("quota-aware provider selection", () => {
     // Previously ["one","one","one","one"].
     expect(picks.slice(0, 3)).toEqual(["one", "two", "three"]);
     expect(new Set(picks).size).toBe(3);
+  });
+
+  it("bonus-first orders a fully stale pool by expiry day and credits", async () => {
+    // Every observation is an hour old, so no account has a usable profile and
+    // the selection used to fall through to the token/recency order, which knows
+    // nothing about credits. The expiry DAY survives staleness (a pack's resetAt
+    // never changes), so the urgent day still leads and the aged-out credit
+    // totals still set the rotation order inside it. "four" holds by far the
+    // biggest budget but expires a day later, so it must NOT take the first turn.
+    const cursors = { one: 0, two: 0, three: 0, four: 0 };
+    mocks.getProviderConnections.mockImplementation(async () => Object.entries(cursors).
+    map(([id, cursor], index) => ({ ...connection(id, index + 1, "codebuddy-cn"), lastUsedAt: null, consecutiveUseCount: cursor })));
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+    mocks.updateProviderConnection.mockImplementation(async (id, patch) => {
+      if (patch.consecutiveUseCount !== undefined) cursors[id] = patch.consecutiveUseCount;
+      return { ...connection(id, 1, "codebuddy-cn"), ...patch };
+    });
+    const stale = 3_600_000;
+    const quotaSnapshotsLoader = async () => [
+      bonusRow("one", "bonus-1", { remaining: 205, limit: 500, resetAt: DAY_ONE + 2 * 3_600_000, ageMs: stale }),
+      bonusRow("two", "bonus-1", { remaining: 104, limit: 500, resetAt: DAY_ONE + 3 * 3_600_000, ageMs: stale }),
+      bonusRow("three", "bonus-1", { remaining: 50, limit: 500, resetAt: DAY_ONE + 4 * 3_600_000, ageMs: stale }),
+      bonusRow("four", "bonus-1", { remaining: 900, limit: 900, resetAt: DAY_TWO + 3_600_000, ageMs: stale }),
+    ];
+
+    const picks = [];
+    for (let call = 0; call < 8; call += 1) {
+      const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+        now: NOW,
+        accountStrategy: "bonus-first",
+        quotaSnapshotsLoader,
+      });
+      picks.push(selected.connectionId);
+    }
+
+    // DAY_ONE's three accounts rotate in credit order; the bigger DAY_TWO
+    // account still gets its turn at the end of every cycle so its snapshots
+    // refresh — it just never pre-empts the urgent day.
+    expect(picks).toEqual([
+      "one", "two", "three", "four",
+      "one", "two", "three", "four",
+    ]);
   });
 
   it("bonus-first leaves a spent account out even when other quotas are stale", async () => {

@@ -220,4 +220,20 @@ describe("day bucketing end to end", () => {
       earliestResetAt: Date.parse("2026-11-08T18:48:53.000Z"),
     });
   });
+
+  it("buckets aged-out windows the same way, because resetAt never changes", () => {
+    // The optimistic ordering feeds `bonusBucketOf` a profile assembled from
+    // snapshots past their freshness deadline. Nothing in the bucketing depends
+    // on how old the observation is — only on the pack's own resetAt — so the
+    // same totals come out, which is what makes stale ordering trustworthy for
+    // the DAY tier (only the within-day amount is approximate).
+    const aged = profileFor([
+      packageRow("one", "bonus-1", { remaining: 100, limit: 100, resetAt: NOW + 2 * 86_400_000 }),
+      packageRow("one", "bonus-2", { remaining: 5, limit: 10, resetAt: NOW + 2 * 86_400_000 + 3_600_000 }),
+      packageRow("one", "bonus-3", { remaining: 99, limit: 100, resetAt: NOW + 3 * 86_400_000 }),
+    ]);
+
+    expect(bonusBucketOf(aged, NOW)?.total).toBe(105);
+    expect(bonusBucketOf(aged, NOW)?.day).toBe(new Date(NOW + 2 * 86_400_000).toISOString().slice(0, 10));
+  });
 });

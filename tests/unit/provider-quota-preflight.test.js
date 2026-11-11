@@ -51,6 +51,48 @@ describe("provider quota preflight", () => {
     expect(evaluate([], { trackerError: true })).toMatchObject({ eligible: true, skip: false, reason: "tracker_error", shouldRefresh: true });
   });
 
+  it("publishes aged-out windows separately so ordering survives a cold pool", () => {
+    // `quotaProfile` must stay null for stale rows (routing floors read its
+    // ratios and a stale low ratio would trip the local 503 floor), so the
+    // aged-out windows ride on their own field for bonus-first to order by.
+    const staleAt = NOW - 1_000;
+    const freshAt = NOW + 60_000;
+    const codebuddy = {
+      provider: "codebuddy-cn",
+      resourceKeys: [],
+      sourceId: "codebuddy-cn:billing-meter:v1",
+    };
+    const pack = (overrides) => {
+      const row = snapshot({
+        sourceId: codebuddy.sourceId,
+        resourceKey: "package:bonus-1",
+        dimensionKey: "credits:capacity",
+        state: "available",
+        resetAt: NOW + 86_400_000,
+        ...overrides,
+      });
+      row.amounts = { limitKind: "absolute", limit: 100, used: 0, remaining: 60, remainingRatio: 0.6, unit: "credits" };
+      return row;
+    };
+    const decision = evaluate([pack({ observedAt: NOW - 3_600_000, staleAt })], codebuddy);
+    expect(decision.quotaProfile).toBeNull();
+    expect(decision.staleRoutingWindows).toEqual([
+      {
+        resourceKey: "package:bonus-1",
+        dimensionKey: "credits:capacity",
+        unit: "credits",
+        ratio: 0.6,
+        resetAt: new Date(NOW + 86_400_000).toISOString(),
+        recurring: null,
+        remaining: 60,
+      },
+    ]);
+    // A fresh observation stays on the profile and is not duplicated here.
+    const fresh = evaluate([pack({ observedAt: NOW - 1_000, staleAt: freshAt })], codebuddy);
+    expect(fresh.quotaProfile?.routingWindows).toHaveLength(1);
+    expect(fresh.staleRoutingWindows).toEqual([]);
+  });
+
   it("accepts fresh available and low observations", () => {
     expect(evaluate([snapshot()])).toMatchObject({ eligible: true, skip: false, reason: "available", freshness: "fresh" });
     expect(evaluate([snapshot({ state: "low" })])).toMatchObject({ eligible: true, skip: false, reason: "low", freshness: "fresh" });

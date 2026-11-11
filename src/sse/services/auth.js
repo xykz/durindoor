@@ -776,11 +776,33 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     //
     // Memoized: the ordering, the affinity check and the rotation cursor all ask
     // for the same accounts, and each bucket walks every routing window.
+    //
+    // Optimistic fallback: `quotaProfile` is null whenever the account's
+    // observations have aged past `PROVIDER_QUOTA_DEFAULTS.freshnessMs` (60s),
+    // and the preflight refreshes only the account it selected, so a mostly cold
+    // pool reports no profile for every account but one and `bonus-first` used to
+    // degrade to the token/recency order — which ignores credits completely.
+    // Aged-out windows are therefore used as a best-effort ordering key. The hard
+    // tier is safe on stale data: a pack's `resetAt` never changes, so the expiry
+    // DAY is as reliable when old as when fresh. Only the within-day credit total
+    // is approximate (we may have spent some since), and a day's relative order
+    // is still far better information than no expiry at all.
     const buckets = new Map();
+    // Fresh windows win over aged-out ones for the SAME pool (a refresh may have
+    // spent credits since), but a stale window for a pool the fresh profile does
+    // not mention is still worth seeing: an account whose only fresh observation
+    // is a recurring refill can hold one-shot packs that lapsed out of scope.
+    const windowsFor = (decision) => {
+      const fresh = decision?.quotaProfile?.routingWindows || [];
+      const stale = Array.isArray(decision?.staleRoutingWindows) ? decision.staleRoutingWindows : [];
+      if (stale.length === 0 || fresh.length === 0) return fresh.length > 0 ? fresh : stale;
+      const seen = new Set(fresh.map((window) => `${window.resourceKey}|${window.dimensionKey}`));
+      return [...fresh, ...stale.filter((window) => !seen.has(`${window.resourceKey}|${window.dimensionKey}`))];
+    };
     const bucketOfId = (id) => {
       if (!bonusFirst || !id) return null;
       if (!buckets.has(id)) {
-        buckets.set(id, bonusBucketOf(quotaDecisions.get(id)?.quotaProfile || null, selectionNow));
+        buckets.set(id, bonusBucketOf({ routingWindows: windowsFor(quotaDecisions.get(id)) }, selectionNow));
       }
       return buckets.get(id);
     };
@@ -793,35 +815,45 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       return earliest === null || day < earliest ? day : earliest;
     }, null) :
     null;
-    // "No observation" is not "expires later". `quotaProfile` is null whenever
-    // the account's snapshots are stale or missing, and the quota preflight only
-    // refreshes the account it already selected — so once one account is warm
-    // the others age out within `PROVIDER_QUOTA_DEFAULTS.freshnessMs` (60s) and
-    // drop every window. Filtering the cohort to accounts with a KNOWN earlier
-    // day then left a cohort of one, and that single account absorbed all the
-    // traffic while its own packs expired in two days and the others' in one.
-    // Accounts never observed therefore stay in the cycle, ordered last: they
-    // take the later turns of every rotation without pre-empting a known urgent
-    // day, and selecting them refreshes their snapshots. An account that WAS
-    // observed and simply holds nothing usable is a different case — it is spent
-    // or refill-only, so it is left out rather than given a turn. Its snapshots
-    // still carry `freshness: "fresh"`, which is how the two cases are told
-    // apart; once they age out it looks unknown again and gets re-probed, which
-    // costs a request that the recurring pool still serves.
-    const unknownConnections = bonusFirst && urgentDay !== null ?
-    availableConnections.filter((candidate) =>
-    bucketOfId(candidate.id) === null && quotaDecisions.get(candidate.id)?.freshness !== "fresh") :
-    [];
-    const urgentConnections = bonusFirst && urgentDay !== null ?
-    [
-      ...availableConnections.filter((candidate) => bucketOfId(candidate.id)?.day === urgentDay),
-      ...unknownConnections] :
+    // The urgent cohort leads; everyone else only gets probe turns. An account
+    // belongs to the cohort when its (fresh or aged-out) expiry day IS the
+    // earliest one. The rest need turns for a different reason: their windows
+    // may be aged out, and a provider grants new one-shot packs at any time, so
+    // an account whose stale day reads "later" can be holding a fresh urgent
+    // pack that only a re-observation would reveal. Never-observed accounts are
+    // in the same position.
+    //
+    // A stale profile must NOT be able to reorder the cohort by amount, though:
+    // `compareBonusRotation` sorts by credits, so a later-day account with a
+    // large aged-out total would take the first turn and defeat the day tier.
+    // Probe accounts are therefore appended AFTER the sorted cohort instead of
+    // being sorted with it.
+    const leadingConnections = bonusFirst && urgentDay !== null ?
+    availableConnections.filter((candidate) => bucketOfId(candidate.id)?.day === urgentDay) :
     availableConnections;
+    const probeConnections = bonusFirst && urgentDay !== null ?
+    availableConnections.filter((candidate) => {
+      const day = bucketOfId(candidate.id)?.day;
+      if (day === urgentDay) return false;
+      if (day === null || day === undefined) {
+        // No usable pack at all. A fresh account here was observed and holds
+        // nothing worth spending (spent or refill-only), so it stays out; an
+        // unobserved one keeps its turns, as described above.
+        return quotaDecisions.get(candidate.id)?.freshness !== "fresh";
+      }
+      // A day read from aged-out windows. It ranks last, but keeps taking turns
+      // so its snapshots get refreshed — a profile that is merely old is not
+      // evidence about packs granted since.
+      return !quotaDecisions.get(candidate.id)?.quotaProfile?.tracked;
+    }) :
+    [];
     // Rotation order for the urgent cohort: biggest same-day budget first, then
     // exact expiry instant, then the caller's stable order. `Array.prototype.sort`
     // is stable, so equal buckets keep their original relative order.
     const rotationOrder = bonusFirst && urgentDay !== null ?
-    [...urgentConnections].sort((a, b) => compareBonusRotation(bucketOfId(a.id), bucketOfId(b.id))) :
+    [
+      ...leadingConnections.sort((a, b) => compareBonusRotation(bucketOfId(a.id), bucketOfId(b.id))),
+      ...probeConnections] :
     null;
     // Affinity survives only while the session's account still holds the most
     // urgent expiring budget. Once another account's credits expire on an
