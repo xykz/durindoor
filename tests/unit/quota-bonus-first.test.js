@@ -131,22 +131,44 @@ describe("bonusBucketOf", () => {
     expect(bucket).toEqual({ day: "2026-11-09", total: 50, earliestResetAt: Date.parse("2026-11-09T02:00:00.000Z") });
   });
 
-  it("ignores recurring refills, empty packs, past expiries, and unknown expiries", () => {
+  it("ignores empty pools and unusable expiries whatever their type", () => {
     const bucket = bonusBucketOf({
       routingWindows: [
-        { resourceKey: "package:monthly", ratio: 1, remaining: 500, resetAt: "2026-07-11T00:00:00.000Z", recurring: true },
+        { resourceKey: "package:monthly", ratio: 1, remaining: 500, resetAt: "2026-12-11T00:00:00.000Z", recurring: true },
         pack("2026-11-08", 1, 0),
         { ...pack("2026-11-08", 2, 50), resetAt: "2026-07-09T00:00:00.000Z" },
         { ...pack("2026-11-08", 3, 50), resetAt: null },
         { ...pack("2026-11-08", 4, 50), resetAt: "not-a-date" },
-        // No recurring marker: cannot prove the credits vanish, so it must not
-        // drive the rotation.
-        { ...pack("2026-11-08", 5, 50), recurring: null },
         pack("2026-11-08", 6, 7),
       ],
     }, NOW);
 
     expect(bucket).toEqual({ day: "2026-11-08", total: 7, earliestResetAt: Date.parse("2026-11-08T06:00:00.000Z") });
+  });
+
+  it("counts a recurring allowance exactly like a one-shot pack", () => {
+    // The old rule required the `recurring: false` marker, so a monthly
+    // allowance was ranked as "never worth spending" even when it expired
+    // first. The marker is re-derived on every fetch and absent from legacy or
+    // imported rows, and the upstream — not the router — decides which pool of
+    // an account a request is debited from, so every pool competes on the only
+    // property that actually costs credits: its own expiry.
+    const bucket = bonusBucketOf({
+      routingWindows: [
+        { resourceKey: "package:monthly", ratio: 1, remaining: 500, resetAt: "2026-07-11T00:00:00.000Z", recurring: true },
+        pack("2026-11-08", 1, 7),
+      ],
+    }, NOW);
+
+    expect(bucket).toEqual({ day: "2026-07-11", total: 500, earliestResetAt: Date.parse("2026-07-11T00:00:00.000Z") });
+  });
+
+  it("counts a pool whose type marker is missing", () => {
+    const bucket = bonusBucketOf({
+      routingWindows: [{ ...pack("2026-11-08", 1, 30), recurring: null }],
+    }, NOW);
+
+    expect(bucket).toEqual({ day: "2026-11-08", total: 30, earliestResetAt: Date.parse("2026-11-08T01:00:00.000Z") });
   });
 
   it("falls back to the ratio when the snapshot carries no absolute amount", () => {
@@ -207,7 +229,9 @@ describe("compareBonusRotation", () => {
 describe("day bucketing end to end", () => {
   it("sums each connection's same-day packs from real-shaped snapshots", () => {
     const profile = profileFor([
-      packageRow("one", "monthly", { remaining: 500, limit: 500, resetAt: NOW + 30 * 86_400_000, recurring: true }),
+      // The recurring allowance outlives every pack here, so the packs' own day
+      // stays the earliest and their amounts are what the test sums.
+      packageRow("one", "monthly", { remaining: 500, limit: 500, resetAt: Date.parse("2026-12-11T00:00:00.000Z"), recurring: true }),
       packageRow("one", "bonus-1", { remaining: 100, limit: 100, resetAt: Date.parse("2026-11-08T18:48:53.000Z") }),
       packageRow("one", "bonus-2", { remaining: 100, limit: 100, resetAt: Date.parse("2026-11-08T22:49:36.000Z") }),
       packageRow("one", "bonus-3", { remaining: 5, limit: 10, resetAt: Date.parse("2026-11-08T22:49:36.000Z") }),
@@ -218,6 +242,21 @@ describe("day bucketing end to end", () => {
       day: "2026-11-08",
       total: 205,
       earliestResetAt: Date.parse("2026-11-08T18:48:53.000Z"),
+    });
+  });
+
+  it("lets an earlier recurring allowance outrank later one-shot packs", () => {
+    // Same shape as the previous case, but the allowance refreshes first, so it
+    // claims the earliest day on exactly the same footing as a pack would.
+    const profile = profileFor([
+      packageRow("one", "monthly", { remaining: 500, limit: 500, resetAt: Date.parse("2026-08-09T00:00:00.000Z"), recurring: true }),
+      packageRow("one", "bonus-1", { remaining: 205, limit: 205, resetAt: Date.parse("2026-11-08T18:48:53.000Z") }),
+    ]);
+
+    expect(bonusBucketOf(profile, NOW)).toEqual({
+      day: "2026-08-09",
+      total: 500,
+      earliestResetAt: Date.parse("2026-08-09T00:00:00.000Z"),
     });
   });
 

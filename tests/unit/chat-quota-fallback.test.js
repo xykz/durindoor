@@ -774,6 +774,45 @@ describe("chat quota fallback orchestration", () => {
     );
   });
 
+  it("retries a sibling after a local concurrency-gate timeout without poisoning provider health", async () => {
+    // Waiting on our own semaphore is not upstream evidence: the account queued
+    // because it was in demand. Benching it for 30s (as a plain 503 fallback
+    // does) would shrink the pool exactly when it is busiest.
+    const first = selected("conn-one");
+    const second = selected("conn-two");
+    const selectionExcludes = [];
+    mocks.getProviderCredentials.mockImplementation(async (_provider, excluded) => {
+      selectionExcludes.push([...(excluded || [])]);
+      if (!excluded?.has("conn-one")) return first;
+      if (!excluded.has("conn-two")) return second;
+      return null;
+    });
+    mocks.handleChatCore
+      .mockResolvedValueOnce({
+        success: false,
+        status: 503,
+        error: "Concurrency limit reached for provider \"codex\" (2 concurrent). Request timed out after 120000ms waiting for a slot.",
+        localQueueTimeout: true,
+        response: new Response("local-queue-timeout", { status: 503 }),
+      })
+      .mockResolvedValueOnce({
+        success: true,
+        response: new Response("data: {\"ok\":true}\n\ndata: [DONE]\n\n", {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        }),
+      });
+
+    const response = await handleChat(request());
+    const text = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(text).toContain("[DONE]");
+    expect(text).not.toContain("local-queue-timeout");
+    expect(selectionExcludes).toEqual([[], ["conn-one"]]);
+    expect(mocks.markAccountUnavailable).not.toHaveBeenCalled();
+  });
+
   it("returns before auth, quota, or database work when already aborted", async () => {
     const controller = new AbortController();
     controller.abort();

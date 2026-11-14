@@ -14,25 +14,30 @@ const OWNER_EPOCH = createHash("sha256")
   .digest("hex");
 
 /**
- * The earliest expiry day on which an account's one-shot credits vanish.
+ * The earliest expiry day on which an account's credits vanish.
  *
- * One-shot packs are grouped by the calendar day of their own `resetAt` (the
- * date prefix of the provider's ISO timestamp — deliberately not a local
- * "today", so no timezone is involved: only the relative order between packs
- * matters). Recurring allowances are excluded because their `resetAt` is the
- * next refill, not the moment the credits disappear, so spending them early
- * wastes nothing.
+ * Every credit pool counts the same way: pools are grouped by the calendar day
+ * of their own `resetAt` (the date prefix of the provider's ISO timestamp —
+ * deliberately not a local "today", so no timezone is involved: only the
+ * relative order between pools matters).
+ *
+ * Pack *type* is deliberately not consulted. A CodeBuddy "recurring" allowance
+ * and a one-shot bonus pack are the same thing operationally — each is a credit
+ * balance that disappears on a date, and the upstream decides which pool it
+ * spends from. Ranking by type would need a stable type per pool, and the
+ * provider re-derives that marker on every fetch; ordering every pool by its
+ * own expiry is both simpler and closer to what the upstream actually does.
  *
  * The account's ranking key is its EARLIEST day, and `total` sums the credits
- * of every pack expiring on that day — a day's worth of packs is one budget,
- * and `ratio` cannot be compared across packs because each pack carries its own
+ * of every pool expiring on that day — a day's worth of pools is one budget,
+ * and `ratio` cannot be compared across pools because each carries its own
  * capacity.
  *
- * @param {{ routingWindows?: Array<{ratio?: number, resetAt?: string|null, recurring?: boolean|null, remaining?: number|null}> }|null} profile
+ * @param {{ routingWindows?: Array<{ratio?: number, resetAt?: string|null, remaining?: number|null}> }|null} profile
  * @param {number} [now] - Reference clock.
  * @returns {{ day: string, total: number, earliestResetAt: number|null }|null}
  *   Earliest expiring day, its credit total, and the exact instant within that
- *   day, or null when the account holds no usable one-shot pack.
+ *   day, or null when the account holds no usable pool.
  */
 export function bonusBucketOf(profile, now = Date.now()) {
   const windows = Array.isArray(profile?.routingWindows) ? profile.routingWindows : [];
@@ -42,7 +47,6 @@ export function bonusBucketOf(profile, now = Date.now()) {
   let total = 0;
   let earliestResetAt = null;
   for (const window of windows) {
-    if (window?.recurring !== false) continue;
     const remaining = window?.remaining;
     // `routingWindow` normalizes the amount to a finite number or null, so
     // `null` here genuinely means "unknown", not "zero".

@@ -25,7 +25,7 @@ vi.mock("@/lib/localDb", () => ({
   getConnectionTokenTotals24h: mocks.getConnectionTokenTotals24h,
 }));
 
-const { getProviderCredentials } = await import("../../src/sse/services/auth.js");
+const { getProviderCredentials, _resetBonusTurnCursors } = await import("../../src/sse/services/auth.js");
 
 const NOW = Date.parse("2026-07-10T12:00:00.000Z");
 
@@ -100,6 +100,9 @@ function providerRow(connectionId, remaining, {
 describe("quota-aware provider selection", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // bonus-first keeps its turn cursor in process memory, so it outlives a test
+    // file's cases unless it is cleared here.
+    _resetBonusTurnCursors();
     mocks.getSettings.mockResolvedValue({});
     mocks.getProxyPools.mockResolvedValue([]);
     mocks.getQuotaFetchState.mockResolvedValue(null);
@@ -701,10 +704,10 @@ describe("quota-aware provider selection", () => {
     expect(picks).toEqual(["one", "two", "one", "two"]);
   });
 
-  it("bonus-first leaves the rotation when only recurring refills remain", async () => {
-    // No one-shot pack holds credits anywhere, so nothing can lapse and the
-    // credit rotation has no ordering to apply: the established round-robin
-    // order (LRU) must take over instead of collapsing onto one account.
+  it("bonus-first leaves the rotation when no pool carries an expiry", async () => {
+    // Nothing anywhere can lapse, so the credit rotation has no ordering to
+    // apply: the established round-robin order (LRU) must take over instead of
+    // collapsing onto one account.
     const lastUsed = { one: null, two: null, three: null };
     mocks.getProviderConnections.mockImplementation(async () => [
       { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: lastUsed.one, consecutiveUseCount: 1 },
@@ -717,9 +720,9 @@ describe("quota-aware provider selection", () => {
       return { ...connection(id, 1, "codebuddy-cn"), ...patch };
     });
     const quotaSnapshotsLoader = async () => [
-      bonusRow("one", "monthly", { remaining: 500, limit: 500, resetAt: DAY_TWO + 3_600_000, recurring: true }),
-      bonusRow("two", "monthly", { remaining: 500, limit: 500, resetAt: DAY_TWO + 3_600_000, recurring: true }),
-      bonusRow("three", "monthly", { remaining: 500, limit: 500, resetAt: DAY_TWO + 3_600_000, recurring: true }),
+      bonusRow("one", "monthly", { remaining: 500, limit: 500, recurring: true }),
+      bonusRow("two", "monthly", { remaining: 500, limit: 500, recurring: true }),
+      bonusRow("three", "monthly", { remaining: 500, limit: 500, recurring: true }),
     ];
 
     const picks = [];
@@ -847,7 +850,11 @@ describe("quota-aware provider selection", () => {
     expect(second.connectionId).toBe("three");
   });
 
-  it("bonus-first ignores a recurring refill refresh in favour of a bonus pack", async () => {
+  it("bonus-first counts a refreshing allowance as expiring credits too", async () => {
+    // The pool type is not consulted: "one" holds an allowance that refreshes in
+    // a minute, which is the soonest expiry in the pool, so it leads even though
+    // "two" holds a one-shot pack. Ranking by type instead would treat "one" as
+    // never worth spending and let its balance lapse.
     mocks.getProviderConnections.mockResolvedValue([
       { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
       { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
@@ -863,10 +870,10 @@ describe("quota-aware provider selection", () => {
       ],
     });
 
-    expect(selected.connectionId).toBe("two");
+    expect(selected.connectionId).toBe("one");
   });
 
-  it("bonus-first falls back to round-robin order when only refills expire", async () => {
+  it("bonus-first still falls back to round-robin when no pool has an expiry", async () => {
     mocks.getProviderConnections.mockResolvedValue([
       { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: new Date(NOW - 10_000).toISOString(), consecutiveUseCount: 1 },
       { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: new Date(NOW - 1_000).toISOString(), consecutiveUseCount: 1 },
@@ -876,15 +883,86 @@ describe("quota-aware provider selection", () => {
     const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
       now: NOW,
       accountStrategy: "bonus-first",
-      // No one-shot pack anywhere: the soonest resetAt belongs to a refill that
-      // merely refreshes, so the plain LRU round-robin order decides.
+      // Nothing here carries a resetAt at all, so there is no expiry to order by
+      // and the plain LRU round-robin order decides.
       quotaSnapshotsLoader: async () => [
-        bonusRow("one", "monthly", { resetAt: NOW + 3_600_000, recurring: true }),
-        bonusRow("two", "monthly", { resetAt: NOW + 600_000, recurring: true }),
+        bonusRow("one", "monthly", { recurring: true }),
+        bonusRow("two", "monthly", { recurring: true }),
       ],
     });
 
     expect(selected.connectionId).toBe("one");
+  });
+
+  it("bonus-first leaves the sticky counter clean for plain round-robin", async () => {
+    // Regression: bonus-first used to advance `consecutiveUseCount` as its turn
+    // cursor. That column is the sticky streak (`currentCount < stickyLimit`),
+    // so the large monotonic values silently disabled sticky turns for the plain
+    // strategy afterwards, and nothing ever reset it. The cursor is now
+    // process-local, so every write path must still persist `1` and a plain
+    // round-robin run must behave exactly as it would have without bonus-first.
+    const lastUsed = { one: null, two: null, three: null };
+    const persisted = { one: 1, two: 1, three: 1 };
+    mocks.getProviderConnections.mockImplementation(async () => [
+      { ...connection("one", 1, "codebuddy-cn"), lastUsedAt: lastUsed.one, consecutiveUseCount: persisted.one },
+      { ...connection("two", 2, "codebuddy-cn"), lastUsedAt: lastUsed.two, consecutiveUseCount: persisted.two },
+      { ...connection("three", 3, "codebuddy-cn"), lastUsedAt: lastUsed.three, consecutiveUseCount: persisted.three },
+    ]);
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin", stickyRoundRobinLimit: 3 });
+    // Stamp `lastUsedAt` from a counter rather than the real clock: the selection
+    // code writes `new Date()`, and two picks can share a millisecond, which
+    // reorders the recency sort and makes this test flap.
+    let clock = 0;
+    mocks.updateProviderConnection.mockImplementation(async (id, patch) => {
+      if (patch.lastUsedAt !== undefined) {
+        clock += 1;
+        lastUsed[id] = new Date(NOW + clock * 1_000).toISOString();
+      }
+      if (patch.consecutiveUseCount !== undefined) persisted[id] = patch.consecutiveUseCount;
+      return { ...connection(id, 1, "codebuddy-cn"), lastUsedAt: lastUsed[id], consecutiveUseCount: persisted[id] };
+    });
+    const resetState = () => {
+      clock = 0;
+      lastUsed.one = null;
+      lastUsed.two = null;
+      lastUsed.three = null;
+      persisted.one = 1;
+      persisted.two = 1;
+      persisted.three = 1;
+    };
+    const bonusSnapshots = async () => [
+      bonusRow("one", "bonus-1", { remaining: 100, limit: 100, resetAt: DAY_ONE + 18 * 3_600_000 }),
+      bonusRow("two", "bonus-1", { remaining: 50, limit: 50, resetAt: DAY_ONE + 19 * 3_600_000 }),
+      bonusRow("three", "bonus-1", { remaining: 40, limit: 40, resetAt: DAY_ONE + 20 * 3_600_000 }),
+    ];
+    const plainRun = async () => {
+      const picks = [];
+      for (let call = 0; call < 6; call += 1) {
+        const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", { now: NOW });
+        picks.push(selected.connectionId);
+      }
+      return picks;
+    };
+
+    // Baseline: plain round-robin from a clean slate.
+    resetState();
+    const baseline = await plainRun();
+
+    // Same slate, but reached through six bonus-first picks (two full cycles of
+    // the credit order), which must leave no trace behind.
+    resetState();
+    for (let call = 0; call < 6; call += 1) {
+      await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+        now: NOW,
+        accountStrategy: "bonus-first",
+        quotaSnapshotsLoader: bonusSnapshots,
+      });
+    }
+    expect(persisted).toEqual({ one: 1, two: 1, three: 1 });
+
+    resetState();
+    const afterBonusFirst = await plainRun();
+    expect(afterBonusFirst).toEqual(baseline);
   });
 
   it("bonus-first treats a whole-second expiry gap as a tie and keeps round-robin order", async () => {

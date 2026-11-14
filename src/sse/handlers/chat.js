@@ -1201,6 +1201,17 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         lastStatus = HTTP_STATUS.SERVICE_UNAVAILABLE;
         continue;
       }
+      if (result.localQueueTimeout) {
+        // Waiting on our own concurrency gate is not provider evidence either.
+        // The account is healthy (it queued because it was in demand), so
+        // benching it for 30s — as a plain 503 fallback would — marks the best
+        // account faulty and shrinks the pool exactly when it is busiest.
+        // Exclude it for this request only and let the siblings serve.
+        excludeConnectionIds.add(credentials.connectionId);
+        lastError = result.error || "Concurrency gate timeout";
+        lastStatus = HTTP_STATUS.SERVICE_UNAVAILABLE;
+        continue;
+      }
 
       const resultAttemptStartedAt = Number.isSafeInteger(result.attemptStartedAt) && result.attemptStartedAt > 0 ?
       result.attemptStartedAt :

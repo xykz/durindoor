@@ -117,6 +117,59 @@ export async function hasValidCliToken(request) {
 // unrelated providers must never queue behind each other's quota/settings I/O.
 const selectionMutexes = new Map();
 
+// bonus-first turn cursors, per provider and connection.
+//
+// These deliberately do NOT reuse `consecutiveUseCount`. That column is the
+// round-robin sticky streak (`currentCount < stickyLimit`), so advancing it to a
+// large monotonic value — which bonus-first needs — silently disables sticky
+// turns for every other strategy, and nothing ever resets it. Keeping the cursor
+// process-local also matches the other selection caches and makes a restart
+// simply start a fresh cycle.
+const bonusTurnCursors = new Map();
+const MAX_BONUS_TURN_PROVIDERS = 200;
+// Cursors only ever grow, so rebase the whole provider's set once the highest
+// climbs past this bound. Keeps the arithmetic exact without unbounded growth.
+const BONUS_CURSOR_REBASE = 1_000_000;
+
+function bonusCursorMap(providerId) {
+  let cursors = bonusTurnCursors.get(providerId);
+  if (!cursors) {
+    if (bonusTurnCursors.size >= MAX_BONUS_TURN_PROVIDERS) {
+      const oldest = bonusTurnCursors.keys().next().value;
+      bonusTurnCursors.delete(oldest);
+    }
+    cursors = new Map();
+    bonusTurnCursors.set(providerId, cursors);
+  }
+  return cursors;
+}
+
+function bonusTurnOf(providerId, connectionId) {
+  if (!connectionId) return 0;
+  return Number(bonusTurnCursors.get(providerId)?.get(connectionId)) || 0;
+}
+
+function advanceBonusTurn(providerId, connectionId, highest) {
+  if (!connectionId) return;
+  const cursors = bonusCursorMap(providerId);
+  const next = (Number(highest) || 0) + 1;
+  cursors.set(connectionId, next);
+  if (next < BONUS_CURSOR_REBASE) return;
+  // Rebase every cursor of this provider by the smallest value so the relative
+  // order — which is all the rotation reads — survives.
+  let floor = Infinity;
+  for (const value of cursors.values()) floor = Math.min(floor, value);
+  if (!Number.isFinite(floor) || floor <= 0) return;
+  for (const [id, value] of cursors) cursors.set(id, value - floor);
+}
+
+/**
+ * Clear every bonus-first turn cursor (for testing).
+ */
+export function _resetBonusTurnCursors() {
+  bonusTurnCursors.clear();
+}
+
 const sessionAffinityState = new Map();
 const MAX_SESSION_AFFINITIES = 5000;
 
@@ -472,9 +525,9 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
   Math.floor(options.connectionTokenBudget) :
   null;
   // Optional per-request strategy override (e.g. `x-account-strategy:
-  // bonus-first`). Runs a round-robin that spends one-shot credit pools in
-  // expiry order. Unknown/absent values keep the persisted strategy; accounts
-  // without any expiring pool fall back to plain round-robin ordering.
+  // bonus-first`). Runs a round-robin that spends credit pools in expiry order.
+  // Unknown/absent values keep the persisted strategy; accounts without any
+  // expiring pool fall back to plain round-robin ordering.
   const accountStrategy = parseAccountStrategy(options?.accountStrategy);
   // Acquire the provider-scoped selection turn. SQLite reservations, not this
   // mutex, remain the global capacity authority at dispatch time.
@@ -763,10 +816,12 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     const stickyConnectionId = sessionId && roundRobin ?
     getSessionAffinity(providerId, sessionId, sessionAffinityTtlMs) :
     null;
-    // bonus-first: the account holding the earliest-expiring one-shot credit
-    // pool wins, because those credits vanish at the deadline while a refill
-    // allowance comes back. Packs are grouped by the calendar day of their own
-    // expiry, and a day's packs form one budget (see bonusBucketOf).
+    // bonus-first: the account holding the earliest-expiring credit budget wins.
+    // Every pool counts — a monthly allowance and a one-shot bonus pack are the
+    // same thing operationally (a balance with an expiry date), and the upstream
+    // decides which pool inside an account is debited. Pools are grouped by the
+    // calendar day of their own expiry, and a day's pools form one budget (see
+    // bonusBucketOf).
     //
     // The expiry DAY is the only hard tier: requests are distributed among the
     // accounts sharing the earliest day, ordered by credits descending, and
@@ -791,7 +846,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     // Fresh windows win over aged-out ones for the SAME pool (a refresh may have
     // spent credits since), but a stale window for a pool the fresh profile does
     // not mention is still worth seeing: an account whose only fresh observation
-    // is a recurring refill can hold one-shot packs that lapsed out of scope.
+    // is one large pool can hold others that lapsed out of scope.
     const windowsFor = (decision) => {
       const fresh = decision?.quotaProfile?.routingWindows || [];
       const stale = Array.isArray(decision?.staleRoutingWindows) ? decision.staleRoutingWindows : [];
@@ -818,10 +873,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     // The urgent cohort leads; everyone else only gets probe turns. An account
     // belongs to the cohort when its (fresh or aged-out) expiry day IS the
     // earliest one. The rest need turns for a different reason: their windows
-    // may be aged out, and a provider grants new one-shot packs at any time, so
-    // an account whose stale day reads "later" can be holding a fresh urgent
-    // pack that only a re-observation would reveal. Never-observed accounts are
-    // in the same position.
+    // may be aged out, and a provider grants new packs at any time, so an account
+    // whose stale day reads "later" can be holding a fresh urgent pool that only
+    // a re-observation would reveal. Never-observed accounts are in the same
+    // position.
     //
     // A stale profile must NOT be able to reorder the cohort by amount, though:
     // `compareBonusRotation` sorts by credits, so a later-day account with a
@@ -836,9 +891,9 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       const day = bucketOfId(candidate.id)?.day;
       if (day === urgentDay) return false;
       if (day === null || day === undefined) {
-        // No usable pack at all. A fresh account here was observed and holds
-        // nothing worth spending (spent or refill-only), so it stays out; an
-        // unobserved one keeps its turns, as described above.
+        // No usable pool at all. A fresh account here was observed and holds
+        // nothing worth spending (spent, or every pool already expired), so it
+        // stays out; an unobserved one keeps its turns, as described above.
         return quotaDecisions.get(candidate.id)?.freshness !== "fresh";
       }
       // A day read from aged-out windows. It ranks last, but keeps taking turns
@@ -894,27 +949,31 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     } else if (roundRobin) {
       const stickyLimit = providerOverride.stickyRoundRobinLimit || selectionSettings.stickyRoundRobinLimit || 3;
       // A single monotonic turn counter, shared by every account of the
-      // provider, is what makes bonus-first's rotation exact. `lastUsedAt` is
-      // millisecond precision and two picks can land in the same millisecond;
-      // `consecutiveUseCount` (already persisted per connection) then decides
-      // which account turned last, and the next turn falls to whichever follows
-      // it in `rotationOrder`.
-      const turnOf = (candidate) => Number(candidate?.consecutiveUseCount) || 0;
-      // Only bonus-first reuses this counter as its turn cursor; the default
-      // round-robin still resets it to 1 so `stickyLimit` keeps counting the
-      // current streak.
-      const turnValue = (picked) => {
-        if (!bonusFirst) return 1;
-        const highest = availableConnections.reduce(
-          (best, candidate) => Math.max(best, turnOf(candidate)),
-          turnOf(picked)
-        );
-        return highest + 1;
+      // provider, is what makes bonus-first's rotation exact: `lastUsedAt` is
+      // millisecond precision and two picks can land in the same millisecond, so
+      // the counter — not the timestamp — decides which account turned last, and
+      // the next turn falls to whichever follows it in `rotationOrder`.
+      // bonus-first reads its turn cursor from the in-process `bonusTurnCursors`
+      // map (see its declaration), NOT from `consecutiveUseCount`. That column is
+      // the round-robin sticky streak: advancing it here would permanently
+      // disable sticky turns for the plain round-robin strategy, and nothing
+      // resets it.
+      const turnOf = (candidate) => bonusTurnOf(providerId, candidate?.id);
+      const highestTurn = () => availableConnections.reduce(
+        (best, candidate) => Math.max(best, turnOf(candidate)),
+        -1
+      );
+      // Only bonus-first owns a turn cursor; every write path still resets the
+      // persisted `consecutiveUseCount` to 1 so `stickyLimit` keeps counting a
+      // streak rather than inheriting another strategy's counter.
+      const stampTurn = (picked) => {
+        if (bonusFirst) advanceBonusTurn(providerId, picked?.id, highestTurn());
+        return 1;
       };
       const pickOldest = () => {
         const totalOf = (candidate) => usageTotals?.get(candidate.id);
-        // `rotationOrder` exists only when some account holds a usable one-shot
-        // pack. Without one there is nothing that can lapse, so the established
+        // `rotationOrder` exists only when some account holds a usable expiring
+        // pool. Without one there is nothing that can lapse, so the established
         // round-robin order takes over instead of the credit rotation.
         if (bonusFirst && rotationOrder) {
           // `rotationOrder` lists the urgent day's accounts biggest budget
@@ -968,7 +1027,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         connection = pickOldest();
         connection = (await updateProviderConnection(connection.id, {
           lastUsedAt: new Date().toISOString(),
-          consecutiveUseCount: turnValue(connection)
+          consecutiveUseCount: stampTurn(connection)
         })) || connection;
       } else {
         // Sort by lastUsed (most recent first) to find current candidate
@@ -999,7 +1058,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
           // Update lastUsedAt and advance the turn cursor (await to ensure persistence)
           connection = (await updateProviderConnection(connection.id, {
             lastUsedAt: new Date().toISOString(),
-            consecutiveUseCount: turnValue(connection)
+            consecutiveUseCount: stampTurn(connection)
           })) || connection;
         }
       }

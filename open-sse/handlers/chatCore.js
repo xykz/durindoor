@@ -1143,7 +1143,13 @@ export async function handleChatCore({ body, modelInfo, credentials: rawCredenti
       if (e instanceof ConcurrencyGateTimeoutError) {
         log?.warn?.("CONCURRENCY", `${concurrencyGateKey} | gate timeout after ${e.timeoutMs}ms (${e.limit} max)`);
         finishTimeline("error", "error", "concurrency gate timeout");
-        return createErrorResult(HTTP_STATUS.SERVICE_UNAVAILABLE, e.message);
+        // `localQueueTimeout` marks a wait we imposed ourselves. The caller must
+        // not treat it as upstream evidence: the account is healthy — it queued
+        // precisely because it was in demand — and benching it would be wrong.
+        return {
+          ...createErrorResult(HTTP_STATUS.SERVICE_UNAVAILABLE, e.message),
+          localQueueTimeout: true
+        };
       }
       if (e?.name === "AbortError") {
         finishTimeline("aborted", "abort", "concurrency gate aborted");
