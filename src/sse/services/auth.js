@@ -29,6 +29,7 @@ import { resolveFallbackModelScope } from "open-sse/services/fallbackScope.js";
 import { getProviderQuotaConfig } from "open-sse/config/providerQuota.js";
 import { getModelQuotaFamily, PROVIDER_ID_TO_ALIAS } from "open-sse/config/providerModels.js";
 import { rankQuotaConnections, bonusBucketOf, compareBonusRotation } from "@/shared/services/quotaSelection";
+import { QUOTA_SELECTION_DEFAULTS } from "open-sse/config/quotaSelection.js";
 import { isRoundRobinStrategy, parseAccountStrategy } from "@/shared/utils/accountStrategy.js";
 import { quotaDecisionDiagnostic } from "open-sse/services/quota/scoring.js";
 import { isQoderQuotaExhaustedBody } from "open-sse/executors/qoder.js";
@@ -164,10 +165,37 @@ function advanceBonusTurn(providerId, connectionId, highest) {
 }
 
 /**
- * Clear every bonus-first turn cursor (for testing).
+ * Clear every bonus-first turn cursor and probe counter (for testing).
  */
 export function _resetBonusTurnCursors() {
   bonusTurnCursors.clear();
+  bonusProbeCounters.clear();
+}
+
+const bonusProbeCounters = new Map();
+
+/**
+ * Pick which probe account, if any, takes this selection.
+ *
+ * A probe account is one whose expiry day is unknown or reads later than the
+ * urgent day. Probes exist for exactly one reason: selecting an account is what
+ * refreshes its snapshots, so the router must touch them eventually or their
+ * data never improves. They must NOT carry the urgent cohort's weight, though —
+ * giving seven later-day accounts an equal turn each hands the single account
+ * holding the soonest-expiring credits only 1/7 of the traffic, which inverts
+ * the strategy. One probe turn every `everyNth` selections keeps every probe
+ * observable at a small, bounded cost.
+ *
+ * @returns {number|null} Index into the probe list, or null for "no probe this turn".
+ */
+function nextBonusProbeSelection(providerId, probeCount, everyNth) {
+  if (!probeCount || !(everyNth > 0)) return null;
+  const tick = (bonusProbeCounters.get(providerId) || 0) + 1;
+  bonusProbeCounters.set(providerId, tick);
+  if (tick % everyNth !== 0) return null;
+  // Walk the probe list one account at a time so every probe is refreshed once
+  // per full round instead of the first becoming the only one ever observed.
+  return (tick / everyNth - 1) % probeCount;
 }
 
 const sessionAffinityState = new Map();
@@ -886,15 +914,15 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     const leadingConnections = bonusFirst && urgentDay !== null ?
     availableConnections.filter((candidate) => bucketOfId(candidate.id)?.day === urgentDay) :
     availableConnections;
-    const probeConnections = bonusFirst && urgentDay !== null ?
+    const staleOnlyConnections = bonusFirst && urgentDay !== null ?
     availableConnections.filter((candidate) => {
       const day = bucketOfId(candidate.id)?.day;
       if (day === urgentDay) return false;
       if (day === null || day === undefined) {
         // No usable pool at all. A fresh account here was observed and holds
         // nothing worth spending (spent, or every pool already expired), so it
-        // stays out; an unobserved one keeps its turns, as described above.
-        return quotaDecisions.get(candidate.id)?.freshness !== "fresh";
+        // stays out; an unobserved one is kept below, in `unknownConnections`.
+        return false;
       }
       // A day read from aged-out windows. It ranks last, but keeps taking turns
       // so its snapshots get refreshed — a profile that is merely old is not
@@ -902,14 +930,32 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       return !quotaDecisions.get(candidate.id)?.quotaProfile?.tracked;
     }) :
     [];
+    // Accounts with NO readable expiry day at all — never observed, or observed
+    // without a usable pool. They are not "known to expire later"; they are
+    // unknown, so any of them could hold the most urgent budget. They therefore
+    // stay in the rotation until an observation tells us where they belong,
+    // which is also what refreshes them.
+    const unknownConnections = bonusFirst && urgentDay !== null ?
+    availableConnections.filter(
+      (candidate) => bucketOfId(candidate.id) === null && quotaDecisions.get(candidate.id)?.freshness !== "fresh"
+    ) :
+    [];
     // Rotation order for the urgent cohort: biggest same-day budget first, then
     // exact expiry instant, then the caller's stable order. `Array.prototype.sort`
     // is stable, so equal buckets keep their original relative order.
+    //
+    // Accounts whose expiry day is KNOWN to be later are deliberately NOT part of
+    // this rotation: they are reached only on a scheduled probe turn (see
+    // `nextBonusProbeSelection`). Letting them take a regular turn spent most of
+    // the traffic on the accounts whose credits have the most time left — with
+    // seven accounts in the pool the single account holding the soonest-expiring
+    // credits got 1/7 of the requests, inverting the strategy. Unknown-day
+    // accounts are appended AFTER the cohort rather than throttled, because until
+    // they are observed there is no evidence that their credits expire later.
     const rotationOrder = bonusFirst && urgentDay !== null ?
-    [
-      ...leadingConnections.sort((a, b) => compareBonusRotation(bucketOfId(a.id), bucketOfId(b.id))),
-      ...probeConnections] :
+    [...leadingConnections.sort((a, b) => compareBonusRotation(bucketOfId(a.id), bucketOfId(b.id))), ...unknownConnections] :
     null;
+    const probeEveryNth = QUOTA_SELECTION_DEFAULTS.bonusProbeEveryNth;
     // Affinity survives only while the session's account still holds the most
     // urgent expiring budget. Once another account's credits expire on an
     // earlier day, staying put would let those lapse, so the session follows the
@@ -976,6 +1022,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         // pool. Without one there is nothing that can lapse, so the established
         // round-robin order takes over instead of the credit rotation.
         if (bonusFirst && rotationOrder) {
+          // Probes come first: their credits expire later, so they are reached
+          // only on a scheduled turn that exists to refresh their snapshots.
+          const probeIndex = nextBonusProbeSelection(providerId, staleOnlyConnections.length, probeEveryNth);
+          if (probeIndex !== null) return staleOnlyConnections[probeIndex];
           // `rotationOrder` lists the urgent day's accounts biggest budget
           // first, so the turn order IS the ordering: draining in that order
           // spends the largest budget first while still spreading load

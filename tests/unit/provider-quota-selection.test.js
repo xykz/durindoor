@@ -650,7 +650,7 @@ describe("quota-aware provider selection", () => {
     ];
 
     const picks = [];
-    for (let call = 0; call < 8; call += 1) {
+    for (let call = 0; call < 6; call += 1) {
       const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
         now: NOW,
         accountStrategy: "bonus-first",
@@ -659,13 +659,49 @@ describe("quota-aware provider selection", () => {
       picks.push(selected.connectionId);
     }
 
-    // DAY_ONE's three accounts rotate in credit order; the bigger DAY_TWO
-    // account still gets its turn at the end of every cycle so its snapshots
-    // refresh — it just never pre-empts the urgent day.
-    expect(picks).toEqual([
-      "one", "two", "three", "four",
-      "one", "two", "three", "four",
-    ]);
+    // DAY_ONE's three accounts rotate in credit order. "four" expires a day
+    // later, so it is NOT part of the rotation any more: an equal turn each used
+    // to hand the single soonest-expiring account only 1/4 of the traffic. It is
+    // reached on a scheduled probe turn instead, which is why it is absent here.
+    expect(picks).toEqual(["one", "two", "three", "one", "two", "three"]);
+  });
+
+  it("bonus-first throttles a known-later account to a scheduled probe turn", async () => {
+    // The regression this guards: with seven accounts in the pool and only one
+    // holding the soonest-expiring credits, appending the six later-day accounts
+    // to the rotation gave the urgent account 1/7 of the traffic. Later-day
+    // accounts must be probed, not rotated with — their snapshots refresh either
+    // way, but the credits that actually lapse are spent first.
+    const cursors = { urgent: 0, later: 0 };
+    mocks.getProviderConnections.mockImplementation(async () => Object.entries(cursors).
+    map(([id, cursor], index) => ({ ...connection(id, index + 1, "codebuddy-cn"), lastUsedAt: null, consecutiveUseCount: cursor })));
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+    mocks.updateProviderConnection.mockImplementation(async (id, patch) => {
+      if (patch.consecutiveUseCount !== undefined) cursors[id] = patch.consecutiveUseCount;
+      return { ...connection(id, 1, "codebuddy-cn"), ...patch };
+    });
+    const stale = 3_600_000;
+    const quotaSnapshotsLoader = async () => [
+      bonusRow("urgent", "bonus-1", { remaining: 60, limit: 60, resetAt: DAY_ONE + 3_600_000, ageMs: stale }),
+      bonusRow("later", "bonus-1", { remaining: 900, limit: 900, resetAt: DAY_TWO + 3_600_000, ageMs: stale }),
+    ];
+
+    const picks = [];
+    for (let call = 0; call < 41; call += 1) {
+      const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+        now: NOW,
+        accountStrategy: "bonus-first",
+        quotaSnapshotsLoader,
+      });
+      picks.push(selected.connectionId);
+    }
+
+    // The urgent account takes every turn except the scheduled probe, which
+    // fires once every QUOTA_SELECTION_DEFAULTS.bonusProbeEveryNth (20) picks.
+    expect(picks.filter((id) => id === "urgent")).toHaveLength(39);
+    expect(picks.filter((id) => id === "later")).toHaveLength(2);
+    expect(picks[19]).toBe("later");
+    expect(picks[39]).toBe("later");
   });
 
   it("bonus-first leaves a spent account out even when other quotas are stale", async () => {

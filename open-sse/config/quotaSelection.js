@@ -18,6 +18,12 @@ export const QUOTA_SELECTION_DEFAULTS = Object.freeze({
   // reported at whole seconds. Day boundaries themselves are compared at date
   // precision, so this tolerance never moves a pool into another day.
   bonusExpiryTieMs: 1000,
+  // How many `bonus-first` selections share the urgent cohort before one turn is
+  // given to a probe account (an account whose expiry day is unknown or reads
+  // later). Probes exist only so their snapshots get refreshed; giving them the
+  // same weight as the urgent cohort would hand most of the traffic to accounts
+  // whose credits expire later, which is the opposite of the strategy.
+  bonusProbeEveryNth: 20,
   starvationMs: 5 * 60 * 1000,
   heartbeatMs: 30 * 1000,
   leaseMs: Math.max(
