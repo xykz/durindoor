@@ -704,6 +704,82 @@ describe("quota-aware provider selection", () => {
     expect(picks[39]).toBe("later");
   });
 
+  it("bonus-first probes a later-day account even while a session is pinned", async () => {
+    // The regression this guards: the probe turn used to be claimed inside
+    // `pickOldest`, which session affinity never reaches. A coding agent holds one
+    // session for hours, so the probe could not fire at all and a never-refreshed
+    // account stayed invisible forever. The turn is now claimed before affinity.
+    const cursors = { urgent: 0, later: 0 };
+    mocks.getProviderConnections.mockImplementation(async () => Object.entries(cursors).
+    map(([id, cursor], index) => ({ ...connection(id, index + 1, "codebuddy-cn"), lastUsedAt: new Date(NOW).toISOString(), consecutiveUseCount: cursor })));
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+    mocks.updateProviderConnection.mockImplementation(async (id, patch) => {
+      if (patch.consecutiveUseCount !== undefined) cursors[id] = patch.consecutiveUseCount;
+      return { ...connection(id, 1, "codebuddy-cn"), ...patch };
+    });
+    // Aged-out windows: a fresh later-day profile is "tracked", and only
+    // unreadable ones are probe-eligible (a fresh one already answered the
+    // question the probe exists to ask).
+    const ageMs = 3_600_000;
+    const quotaSnapshotsLoader = async () => [
+      bonusRow("urgent", "bonus-1", { remaining: 60, limit: 60, resetAt: DAY_ONE + 3_600_000, ageMs }),
+      bonusRow("later", "bonus-1", { remaining: 900, limit: 900, resetAt: DAY_TWO + 3_600_000, ageMs }),
+    ];
+
+    const picks = [];
+    for (let call = 0; call < 41; call += 1) {
+      const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+        now: NOW,
+        accountStrategy: "bonus-first",
+        sessionId: "sess-probe-under-affinity",
+        quotaSnapshotsLoader,
+      });
+      picks.push(selected.connectionId);
+    }
+
+    // Affinity keeps the urgent account for every ordinary turn; only the
+    // scheduled probe yields it, which is what refreshes the later account.
+    expect(picks.filter((id) => id === "urgent")).toHaveLength(39);
+    expect(picks.filter((id) => id === "later")).toHaveLength(2);
+    expect(picks[19]).toBe("later");
+    expect(picks[39]).toBe("later");
+  });
+
+  it("bonus-first reaches a never-observed account while a session is pinned", async () => {
+    // A pinned session must not be able to starve an account that has no readable
+    // expiry day: until it is observed there is no evidence its credits expire
+    // later, so it stays probe-eligible. Without this it can never be observed.
+    const cursors = { urgent: 0, cold: 0 };
+    mocks.getProviderConnections.mockImplementation(async () => Object.entries(cursors).
+    map(([id, cursor], index) => ({ ...connection(id, index + 1, "codebuddy-cn"), lastUsedAt: new Date(NOW).toISOString(), consecutiveUseCount: cursor })));
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+    mocks.updateProviderConnection.mockImplementation(async (id, patch) => {
+      if (patch.consecutiveUseCount !== undefined) cursors[id] = patch.consecutiveUseCount;
+      return { ...connection(id, 1, "codebuddy-cn"), ...patch };
+    });
+    // "cold" has NO rows at all. Its snapshots appear once it is finally probed.
+    const ageMs = 3_600_000;
+    let observed = false;
+    const quotaSnapshotsLoader = async () => [
+      bonusRow("urgent", "bonus-1", { remaining: 60, limit: 60, resetAt: DAY_TWO + 3_600_000, ageMs }),
+      ...(observed ? [bonusRow("cold", "bonus-1", { remaining: 60, limit: 60, resetAt: DAY_ONE + 3_600_000, ageMs })] : []),
+    ];
+
+    const picks = [];
+    for (let call = 0; call < 21; call += 1) {
+      const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+        now: NOW,
+        accountStrategy: "bonus-first",
+        sessionId: "sess-cold-probe",
+        quotaSnapshotsLoader,
+      });
+      picks.push(selected.connectionId);
+      if (selected.connectionId === "cold") observed = true;
+    }
+
+    expect(picks[19]).toBe("cold");
+  });
+
   it("bonus-first leaves a spent account out even when other quotas are stale", async () => {
     // The unreadable-account rule must not resurrect genuinely spent accounts:
     // "three" WAS observed and holds nothing usable, so it stays out of the

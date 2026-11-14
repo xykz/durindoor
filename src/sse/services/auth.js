@@ -956,16 +956,39 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     [...leadingConnections.sort((a, b) => compareBonusRotation(bucketOfId(a.id), bucketOfId(b.id))), ...unknownConnections] :
     null;
     const probeEveryNth = QUOTA_SELECTION_DEFAULTS.bonusProbeEveryNth;
+    // Probe turns must be claimable BEFORE the session-affinity branch returns.
+    // A session pins one account for as long as it remains eligible, so with a
+    // long-lived session (the normal case for a coding agent) `pickOldest` never
+    // runs and a scheduled probe would never fire: an account holding the
+    // soonest-expiring credits but no readable snapshot could then stay invisible
+    // forever. The turn is claimed here, once per selection, and consumed by the
+    // probe branch below, which runs before affinity.
+    //
+    // The list covers both shapes that need a refresh: accounts whose aged-out
+    // windows read later, and accounts with no readable expiry day at all. The
+    // latter keep regular turns inside `rotationOrder` for sessionless traffic,
+    // but a session would otherwise pin them out of existence — which is exactly
+    // how a never-refreshed account stays never-refreshed.
+    const probeConnections = bonusFirst && rotationOrder ?
+    [...staleOnlyConnections, ...unknownConnections] :
+    [];
+    const probeIndex = probeConnections.length > 0 ?
+    nextBonusProbeSelection(providerId, probeConnections.length, probeEveryNth) :
+    null;
+    // A probe turn belongs to an account the session is not on, so it outranks
+    // affinity: the session must yield for this one request, otherwise the pinned
+    // account would absorb the turn that exists to refresh somebody else.
+    const probeConnection = probeIndex === null ? null : probeConnections[probeIndex];
     // Affinity survives only while the session's account still holds the most
-    // urgent expiring budget. Once another account's credits expire on an
-    // earlier day, staying put would let those lapse, so the session follows the
-    // rotation instead (requirement: cross a day boundary and affinity is cut).
-    // With no expiring budget anywhere there is nothing to lose, so affinity is
-    // kept as-is.
+    // urgent expiring budget, and never on a probe turn. Once another account's
+    // credits expire on an earlier day, staying put would let those lapse, so the
+    // session follows the rotation instead (requirement: cross a day boundary and
+    // affinity is cut). With no expiring budget anywhere there is nothing to
+    // lose, so affinity is kept as-is.
     const affinityEligible = !bonusFirst ||
     urgentDay === null ||
-    bucketOfId(stickyConnectionId)?.day === urgentDay;
-    const stickyConnection = stickyConnectionId && affinityEligible ?
+    (!probeConnection && bucketOfId(stickyConnectionId)?.day === urgentDay);
+    const stickyConnection = probeConnection ? null : stickyConnectionId && affinityEligible ?
     availableConnections.find((c) => c.id === stickyConnectionId) :
     null;
 
@@ -979,6 +1002,16 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     if (connection) {
 
       // skip strategy
+    } else if (probeConnection) {
+      // Scheduled probe: a later-day account takes this one request so its
+      // snapshots get re-read. Affinity is deliberately bypassed (see
+      // `affinityEligible`) and the session re-anchors on its account on the
+      // next request, because the write below only touches the probed account.
+      connection = (await updateProviderConnection(probeConnection.id, {
+        lastUsedAt: new Date().toISOString(),
+        consecutiveUseCount: 1
+      })) || probeConnection;
+      log.debug("AUTH", `${provider} | bonus-first probe → ${connection.id?.slice(0, 8)}`);
     } else if (stickyConnection) {connection = stickyConnection;
       log.debug("AUTH", `${provider} | session-sticky ${sessionId.slice(0, 8)} → ${connection.id?.slice(0, 8)}`);
       connection = (await updateProviderConnection(connection.id, {
@@ -1022,10 +1055,6 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         // pool. Without one there is nothing that can lapse, so the established
         // round-robin order takes over instead of the credit rotation.
         if (bonusFirst && rotationOrder) {
-          // Probes come first: their credits expire later, so they are reached
-          // only on a scheduled turn that exists to refresh their snapshots.
-          const probeIndex = nextBonusProbeSelection(providerId, staleOnlyConnections.length, probeEveryNth);
-          if (probeIndex !== null) return staleOnlyConnections[probeIndex];
           // `rotationOrder` lists the urgent day's accounts biggest budget
           // first, so the turn order IS the ordering: draining in that order
           // spends the largest budget first while still spreading load
