@@ -1146,7 +1146,14 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       connection = availableConnections[0];
     }
 
-    if (connection && roundRobin && sessionId) {
+    // Affinity is not re-anchored on a probe turn. The probe deliberately runs
+    // off-session for one request, and re-anchoring would move the session onto
+    // the probed account: the session then finds its own account ineligible on
+    // the next request (the probe's credits expire later), loses affinity, and
+    // takes one extra off-target turn through the rotation — which can land on an
+    // unobserved account — before returning. Skipping the write keeps the anchor
+    // pointing at the account the session was actually on.
+    if (connection && roundRobin && sessionId && !probeConnection) {
       rememberSessionAffinity(providerId, sessionId, connection.id);
     }
 

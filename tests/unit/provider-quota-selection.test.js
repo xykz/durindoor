@@ -385,6 +385,7 @@ describe("quota-aware provider selection", () => {
 
   const DAY_ONE = Date.parse("2026-07-11T00:00:00.000Z");
   const DAY_TWO = Date.parse("2026-07-12T00:00:00.000Z");
+  const DAY_ZERO = Date.parse("2026-07-10T18:00:00.000Z");
 
   it("bonus-first sums one day's packs and gives the biggest budget the first turn", async () => {
     // "one" is the most recently used and has the highest token total, so plain
@@ -778,6 +779,81 @@ describe("quota-aware provider selection", () => {
     }
 
     expect(picks[19]).toBe("cold");
+  });
+
+  it("bonus-first returns the pinned session to its account right after a probe", async () => {
+    // The probe borrows exactly one request. If the probe also re-anchored the
+    // session (it used to: affinity is written for every selection), the session
+    // would land on the probed account, find it ineligible on the next request
+    // (its credits expire later), and burn an extra off-target turn — which can
+    // land on an unobserved account — before coming back.
+    const cursors = { urgent: 0, later: 0 };
+    mocks.getProviderConnections.mockImplementation(async () => Object.entries(cursors).
+    map(([id, cursor], index) => ({ ...connection(id, index + 1, "codebuddy-cn"), lastUsedAt: new Date(NOW).toISOString(), consecutiveUseCount: cursor })));
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+    mocks.updateProviderConnection.mockImplementation(async (id, patch) => {
+      if (patch.consecutiveUseCount !== undefined) cursors[id] = patch.consecutiveUseCount;
+      return { ...connection(id, 1, "codebuddy-cn"), ...patch };
+    });
+    const ageMs = 3_600_000;
+    const quotaSnapshotsLoader = async () => [
+      bonusRow("urgent", "bonus-1", { remaining: 60, limit: 60, resetAt: DAY_ONE + 3_600_000, ageMs }),
+      bonusRow("later", "bonus-1", { remaining: 900, limit: 900, resetAt: DAY_TWO + 3_600_000, ageMs }),
+    ];
+
+    const picks = [];
+    for (let call = 0; call < 22; call += 1) {
+      const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+        now: NOW,
+        accountStrategy: "bonus-first",
+        sessionId: "sess-probe-anchor",
+        quotaSnapshotsLoader,
+      });
+      picks.push(selected.connectionId);
+    }
+
+    // Only the probe turn leaves the urgent account, and the very next request is
+    // back on it — no detour through the rotation.
+    expect(picks[19]).toBe("later");
+    expect(picks[20]).toBe("urgent");
+    expect(picks.filter((id) => id === "later")).toHaveLength(1);
+  });
+
+  it("bonus-first hands the session over when a probe finds an earlier expiry", async () => {
+    // Preserving the anchor must not freeze the session on a stale account: once a
+    // probe reveals sooner-expiring credits elsewhere, the session follows.
+    const cursors = { urgent: 0, later: 0 };
+    mocks.getProviderConnections.mockImplementation(async () => Object.entries(cursors).
+    map(([id, cursor], index) => ({ ...connection(id, index + 1, "codebuddy-cn"), lastUsedAt: new Date(NOW).toISOString(), consecutiveUseCount: cursor })));
+    mocks.getSettings.mockResolvedValue({ fallbackStrategy: "round-robin" });
+    mocks.updateProviderConnection.mockImplementation(async (id, patch) => {
+      if (patch.consecutiveUseCount !== undefined) cursors[id] = patch.consecutiveUseCount;
+      return { ...connection(id, 1, "codebuddy-cn"), ...patch };
+    });
+    const ageMs = 3_600_000;
+    // "urgent" starts out holding the earliest day, so the session pins it. The
+    // probe then reveals that "later" actually expires a day EARLIER still.
+    let probed = false;
+    const quotaSnapshotsLoader = async () => [
+      bonusRow("urgent", "bonus-1", { remaining: 60, limit: 60, resetAt: DAY_ONE + 3_600_000, ageMs }),
+      bonusRow("later", "bonus-1", { remaining: 900, limit: 900, resetAt: probed ? DAY_ZERO : DAY_TWO + 3_600_000, ageMs }),
+    ];
+
+    const picks = [];
+    for (let call = 0; call < 26; call += 1) {
+      const selected = await getProviderCredentials("codebuddy-cn", null, "deepseek-v4.1-flash", {
+        now: NOW,
+        accountStrategy: "bonus-first",
+        sessionId: "sess-probe-handover",
+        quotaSnapshotsLoader,
+      });
+      picks.push(selected.connectionId);
+      if (selected.connectionId === "later") probed = true;
+    }
+
+    expect(picks[19]).toBe("later");
+    // After the probe the session sticks with the now-earlier-expiring account.
+    expect(picks.slice(20).every((id) => id === "later")).toBe(true);
   });
 
   it("bonus-first leaves a spent account out even when other quotas are stale", async () => {
