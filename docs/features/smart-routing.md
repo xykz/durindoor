@@ -73,6 +73,29 @@ CodeBuddy CN throttles an account once its trailing 24-hour token total approach
 - **Rolling-24h balancing.** New round-robin sessions prefer the account with the lowest `promptTokens + completionTokens` over the trailing 24 hours (from `usageHistory`), falling back to `lastUsedAt`/`priority` on ties or read failure. This uses a rolling window rather than a calendar day so a midnight rollover cannot reset a still-hot account.
 - **Per-request budget.** The `x-connection-token-budget` header (bare counts or `k`/`m`/`b` suffixes, e.g. `180m` or `180000000`) drops any account at or above that trailing-24h total from the candidate pool. If every account in scope reaches the budget, selection returns a 503 `allRateLimited` rather than routing to a throttled account. The budget applies to CodeBuddy CN only; without the header there is no budget.
 
+### Allowance strategies (CodeBuddy CN)
+
+The `x-account-strategy` header selects an allowance-driven ordering instead of the default rotation. It is honoured **only** for `codebuddy-cn`; on any other provider the header is ignored and routing is unchanged. There is no dashboard setting — the choice is per request.
+
+| Value | What it orders by |
+| --- | --- |
+| `least-used` | The account that has spent the least of its reported allowance goes first. |
+| `use-before-expiry` | Whatever allowance is left is spent before it is lost, soonest loss first. |
+
+Both read the persisted per-account quota snapshots (`docs/features/quota-tracking.md`), not the trailing-24h token totals that drive the default rotation. An account's position comes from its **fullest** window rather than an average, because the upstream refuses once any single pool is empty — the tightest pool is what the account can still serve.
+
+`least-used` orders known-with-room accounts by share spent, then accounts with no reading at all, then those running low, then those already spent or cooling. An unread account is never treated as an unused one: that is how a paid balance gets drained while a subscription pool nobody read sits idle.
+
+`use-before-expiry` orders every account that still holds allowance by when that allowance is lost, then the accounts that report no expiry, then empty or cooling ones. Within the same expiry, the account with more room goes first: both packs are lost at the same moment, so the amount wasted is whatever is left unspent, and sending traffic to the account about to run dry only causes a mid-request refusal. This deliberately departs from magpie's free-before-paid partitioning — that shape exists to keep a *group* from spending money, whereas here the goal is to burn a single provider's expiring allowance.
+
+A window whose reset time has passed counts as renewed rather than as unknown, so a stale reading can still rank an account instead of dropping it out of the plan.
+
+While an allowance strategy is in force, the round-robin sticky count, the 24h token totals, and the quota score ranking are all bypassed — the plan decides the order itself. They return as soon as the header is absent.
+
+A conversation keeps its account for as long as its turn is open, and is re-planned at every new turn. A turn stays open across tool round-trips (a user message carrying only tool results does not start a new one) and closes when the user speaks again. This keeps one task on one warm prompt cache without letting a long session pin an account past its allowance. The turn is derived from the request body, so no extra header is needed. An explicit `x-connection-id` pin still wins over the plan.
+
+Allowance readings are kept warm by a background whole-pool refresh: while requests are being routed, at most one read per provider is in flight, a provider is re-read at most once per `poolRefreshIntervalMs` (60s), and reads run sequentially rather than in parallel. The refresh happens *after* the current request has been routed and no request ever waits for it; an idle gateway makes no upstream calls. A 402 or 429 refusal re-reads that account immediately, because a refusal is the freshest evidence that the reading used for ranking was wrong.
+
 ## Request Translation
 
 Client tools do not all speak the same format. DurinDoor translates between OpenAI, Anthropic Claude, Gemini, OpenAI Responses, Kiro, Cursor, CommandCode, Ollama, Vertex, and other supported shapes.

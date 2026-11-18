@@ -472,7 +472,8 @@ export async function inspectProviderQuota(connections, {
   now = Date.now(),
   connectionWide = false,
   snapshotsLoader = null,
-  fetchStateLoader = null
+  fetchStateLoader = null,
+  snapshotsSink = null
 } = {}) {
   const config = getProviderQuotaConfig(provider);
   const refreshSupported = Boolean(config);
@@ -486,6 +487,15 @@ export async function inspectProviderQuota(connections, {
       return db.listProviderQuotaSnapshots(query);
     });
     snapshots = await loader({ provider, includeStale: true, now });
+    // Callers that rank by allowance need the raw rows, not only the gate
+    // decisions: the projections below deliberately drop what routing needs.
+    if (typeof snapshotsSink === "function") {
+      try {
+        snapshotsSink(snapshots);
+      } catch {
+        // A projection consumer must never break quota inspection.
+      }
+    }
     if (config?.sourceId) {
       const loadFetchState = fetchStateLoader || (snapshotsLoader ? async () => null : async (query) => {
         const db = await import("@/lib/localDb");
