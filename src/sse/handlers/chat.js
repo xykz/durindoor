@@ -42,6 +42,8 @@ import { detectFormat } from "open-sse/services/provider.js";
 import { isAntigravityCapacityError, isRequestReplayBufferError } from "open-sse/services/accountFallback.js";
 import { resolveClientSessionId, parseSessionAffinityTtl } from "open-sse/utils/sessionManager.js";
 import { parseTokenBudget } from "@/shared/utils/tokenBudget.js";
+import { accountStrategyAppliesTo, parseAccountStrategy } from "@/shared/utils/accountStrategy.js";
+import { countConversationTurns } from "@/shared/services/accountUsagePlan";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials } from "../services/tokenRefresh.js";
 import { refreshAndUpdateCredentials } from "@/shared/services/providerCredentials";
@@ -863,6 +865,21 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     clientRawRequest?.headers?.["x-connection-token-budget"]
   );
 
+  // Per-request account ordering by provider-reported allowance. Both values are
+  // honoured only for the providers the strategy may reorder; another provider
+  // keeps its persisted strategy, so the header cannot reshape routing outside
+  // the quota shape it understands.
+  const requestedAccountStrategy = parseAccountStrategy(
+    clientRawRequest?.headers?.["x-account-strategy"]
+  );
+  const accountStrategy = accountStrategyAppliesTo(resolveProviderId(provider), requestedAccountStrategy) ?
+  requestedAccountStrategy :
+  null;
+  // Turn signature for turn-scoped affinity: an agent's tool round-trips keep
+  // the same count, so they stay on one account; the user's next message moves
+  // it and the account is re-planned.
+  const conversationTurn = accountStrategy ? countConversationTurns(body) : null;
+
   // Resolve request-scoped custom capabilities once, just before the retry loop.
   // Custom model aliases are stored by provider prefix; requestPrefix carries
   // the prefix the caller actually used (e.g. node alias or bare model alias).
@@ -913,7 +930,9 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
           preferredConnectionId: preferredConnectionId || requestReplayConnectionId,
           preferredConnectionIds: requestReplayConnectionId ? [requestReplayConnectionId] : preferredConnectionIds,
           sessionAffinityTtlMs,
-          connectionTokenBudget
+          connectionTokenBudget,
+          accountStrategy,
+          conversationTurn
         });
       } catch (error) {
         if (error?.name === "AbortError" || requestAborted(request, requestSignal)) return errorResponse(499, "Request aborted");
@@ -1198,7 +1217,19 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         (result.status === 409 || (result.status === 429 && !Number.isFinite(result.resetsAtMs))) &&
         activeConnection &&
         !refreshedQuotaConnectionIds.has(credentials.connectionId);
-      if (shouldRefreshAntigravityQuota) {
+      /**
+       * An allowance-driven plan needs the refusal's account re-read at once,
+       * not at the next pool cycle: the refusal is the freshest evidence there
+       * is that the reading was wrong. Re-read, then reselect so the plan ranks
+       * on what the vendor just said. Only refusals about quota or rate are
+       * evidence about the allowance; a plain failure is not.
+       */
+      const shouldRefreshAllowanceAccount =
+        Boolean(accountStrategy) &&
+        (result.status === 402 || result.status === 429) &&
+        activeConnection &&
+        !refreshedQuotaConnectionIds.has(credentials.connectionId);
+      if (shouldRefreshAntigravityQuota || shouldRefreshAllowanceAccount) {
         refreshedQuotaConnectionIds.add(credentials.connectionId);
         try {
           const refreshResult = await refreshProviderQuota(activeConnection, {

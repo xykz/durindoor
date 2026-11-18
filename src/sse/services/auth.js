@@ -29,6 +29,10 @@ import { resolveFallbackModelScope } from "open-sse/services/fallbackScope.js";
 import { getProviderQuotaConfig } from "open-sse/config/providerQuota.js";
 import { getModelQuotaFamily, PROVIDER_ID_TO_ALIAS } from "open-sse/config/providerModels.js";
 import { rankQuotaConnections } from "@/shared/services/quotaSelection";
+import { planAccountUsage } from "@/shared/services/accountUsagePlan";
+import { schedulePoolRefresh } from "@/shared/services/quotaPoolRefresh";
+import { accountStrategyAppliesTo } from "@/shared/utils/accountStrategy.js";
+import { resolvePoolRefreshIntervalMs } from "open-sse/config/quotaSelection.js";
 import { quotaDecisionDiagnostic } from "open-sse/services/quota/scoring.js";
 import { isQoderQuotaExhaustedBody } from "open-sse/executors/qoder.js";
 import { isOverLimit, recordRequest, retryAfterMs } from "./rpmLimiter.js";
@@ -130,14 +134,15 @@ function sessionAffinityKey(providerId, sessionId) {
   return `${providerId}:${sessionId}`;
 }
 
-function rememberSessionAffinity(providerId, sessionId, connectionId) {
+function rememberSessionAffinity(providerId, sessionId, connectionId, turn = null) {
   if (!providerId || !sessionId || !connectionId) return;
   if (sessionAffinityState.size >= MAX_SESSION_AFFINITIES) {
     sessionAffinityState.delete(sessionAffinityState.keys().next().value);
   }
   sessionAffinityState.set(sessionAffinityKey(providerId, sessionId), {
     connectionId,
-    lastUsed: Date.now()
+    lastUsed: Date.now(),
+    turn
   });
 }
 
@@ -154,6 +159,36 @@ function getSessionAffinity(providerId, sessionId, ttlMs = MEMORY_CONFIG.session
     sessionAffinityState.delete(key);
     return null;
   }
+  entry.lastUsed = Date.now();
+  return entry.connectionId || null;
+}
+
+/**
+ * Read the account a conversation is bound to for its current turn.
+ *
+ * A header-driven allowance strategy keeps a conversation on one account while
+ * the turn is still open and re-plans on every new turn. The binding therefore
+ * carries the turn signature it was made under: a request whose signature moved
+ * (the user said something new) is not kept, and the account is re-planned. A
+ * turn that cannot be read (no messages, no readable body) never keeps anything.
+ *
+ * @param {string} providerId - Resolved provider id.
+ * @param {string|null} sessionId - Conversation identifier.
+ * @param {number|null} turn - Turn signature from countConversationTurns.
+ * @param {number} ttlMs - Upper bound on how long a binding may live.
+ * @returns {string|null} Bound connection id, or null.
+ */
+function getTurnAffinity(providerId, sessionId, turn, ttlMs = MEMORY_CONFIG.sessionTtlMs) {
+  if (!providerId || !sessionId || !Number.isFinite(turn)) return null;
+  if (!(ttlMs > 0)) return null;
+  const key = sessionAffinityKey(providerId, sessionId);
+  const entry = sessionAffinityState.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.lastUsed > ttlMs) {
+    sessionAffinityState.delete(key);
+    return null;
+  }
+  if (!Number.isFinite(entry.turn) || entry.turn !== turn) return null;
   entry.lastUsed = Date.now();
   return entry.connectionId || null;
 }
@@ -470,6 +505,21 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
   options.connectionTokenBudget > 0 ?
   Math.floor(options.connectionTokenBudget) :
   null;
+  // Header-driven allowance strategy (`x-account-strategy`). Parsed by the
+  // caller; ignored here unless this provider is one the strategy may reorder,
+  // so a caller cannot reshape routing for a provider whose quota shape the
+  // strategy does not understand.
+  const allowanceStrategy = accountStrategyAppliesTo(providerId, options?.accountStrategy) ?
+  options.accountStrategy :
+  null;
+  // Turn signature for turn-scoped affinity: while it does not move, the
+  // conversation continues the same turn and keeps its account.
+  const conversationTurn = allowanceStrategy && Number.isFinite(options?.conversationTurn) ?
+  options.conversationTurn :
+  null;
+  // Raw persisted readings, captured from the inspection below. Ranking by
+  // allowance needs the rows the gate projection deliberately drops.
+  let quotaSnapshots = null;
   // Acquire the provider-scoped selection turn. SQLite reservations, not this
   // mutex, remain the global capacity authority at dispatch time.
   const currentMutex = selectionMutexes.get(providerId) || Promise.resolve();
@@ -509,9 +559,31 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       resourceKeys,
       now: selectionNow,
       snapshotsLoader: options?.quotaSnapshotsLoader || null,
-      fetchStateLoader: options?.quotaFetchStateLoader || null
+      fetchStateLoader: options?.quotaFetchStateLoader || null,
+      snapshotsSink: allowanceStrategy ? (rows) => {quotaSnapshots = rows;} : null
     });
     throwIfAborted(signal);
+
+    // Allowance ordering is only as good as the readings it sorts. The
+    // preflight wrapper refreshes the account it is about to use and nothing
+    // else, so without this the rest of the pool is never re-read and most
+    // accounts would rank as "unknown" forever. Kick a whole-pool read in the
+    // background — never awaited, at most one in flight per provider, and none
+    // at all when no requests arrive.
+    if (allowanceStrategy) {
+      try {
+        schedulePoolRefresh({
+          provider: providerId,
+          connections,
+          refresh: options?.quotaRefresher || refreshProviderQuota,
+          now: selectionNow,
+          intervalMs: resolvePoolRefreshIntervalMs(settings?.quotaSelection || {}, providerId),
+          onError: (error) => log.warn("QUOTA", `${providerId} pool refresh failed: ${error?.message || "unknown"}`)
+        });
+      } catch {
+        // Scheduling is best-effort; selection proceeds on persisted readings.
+      }
+    }
 
     const isNoAuthProvider = AI_PROVIDERS[providerId]?.noAuth === true;
     const publicFallbackAllowed = providerAllowsPublicNoAuthFallback(providerId) && !excludeSet.has("noauth");
@@ -728,7 +800,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     // otherwise fetch it once. Read-only signal; a null/empty map (other
     // providers, read failure) leaves lastUsedAt/priority ordering untouched.
     const usageTotals = connectionTokenTotals ||
-    (providerId === "codebuddy-cn" && strategy === "round-robin" ?
+    (providerId === "codebuddy-cn" && !allowanceStrategy && strategy === "round-robin" ?
     await getConnectionTokenTotals24h(
       availableConnections.map((candidate) => candidate.id),
       new Date(selectionNow)
@@ -752,6 +824,33 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     availableConnections.find((c) => c.id === stickyConnectionId) :
     null;
 
+    // Header-driven allowance ordering. These strategies replace the strategy
+    // chain entirely while they are in force: they decide the order themselves,
+    // and the round-robin sticky count / 24h token total below exist to keep a
+    // plain rotation fair, not to override an allowance plan.
+    //
+    // A conversation keeps its account for as long as its turn is open and is
+    // re-planned at every new turn, which is the granularity an agent needs
+    // (one task stays on one prefix cache) without letting a long session pin
+    // an account past its allowance. There is no probe: unlike a rotation, the
+    // plan already changes on its own as readings move.
+    let allowancePlan = null;
+    let allowanceSticky = null;
+    if (allowanceStrategy) {
+      const turnStickyId = sessionId ? getTurnAffinity(providerId, sessionId, conversationTurn, sessionAffinityTtlMs) : null;
+      allowanceSticky = turnStickyId ? availableConnections.find((c) => c.id === turnStickyId) : null;
+      allowancePlan = planAccountUsage(availableConnections, quotaSnapshots, {
+        strategy: allowanceStrategy,
+        now: selectionNow,
+        config: selectionSettings.quotaSelection || {}
+      });
+      if (allowancePlan.length > 0) {
+        log.debug("AUTH", `${provider} | ${allowanceStrategy} plan: ${allowancePlan.
+        map((entry) => `${entry.connectionId?.slice(0, 8)}=${entry.tier}/${entry.usedShare === null ? "?" : entry.usedShare.toFixed(2)}`).
+        join(" ")}`);
+      }
+    }
+
     // Pin to preferred connection if specified and available
     if (preferredConnectionId) {
       connection = availableConnections.find((c) => c.id === preferredConnectionId);
@@ -762,12 +861,23 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     if (connection) {
 
       // skip strategy
+    } else if (allowanceStrategy && allowanceSticky) {
+      connection = allowanceSticky;
+      log.debug("AUTH", `${provider} | ${allowanceStrategy} keeps turn ${conversationTurn} → ${connection.id?.slice(0, 8)}`);
+      connection = (await updateProviderConnection(connection.id, {
+        lastUsedAt: new Date().toISOString()
+      })) || connection;
+    } else if (allowanceStrategy && allowancePlan?.length > 0) {
+      connection = allowancePlan[0].connection;
+      connection = (await updateProviderConnection(connection.id, {
+        lastUsedAt: new Date().toISOString()
+      })) || connection;
     } else if (stickyConnection) {connection = stickyConnection;
       log.debug("AUTH", `${provider} | session-sticky ${sessionId.slice(0, 8)} → ${connection.id?.slice(0, 8)}`);
       connection = (await updateProviderConnection(connection.id, {
         lastUsedAt: new Date().toISOString()
       })) || connection;
-    } else if (quotaRanked && strategy !== "round-robin") {
+    } else if (quotaRanked && !allowanceStrategy && strategy !== "round-robin") {
       // Persistent pressure + last-selection history provide the fairness tier
       // for quota-comparable accounts. Atomic acquire remains the final arbiter.
       // Under round-robin, quota score only reorders the candidate pool (above);
@@ -837,6 +947,11 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
 
     if (connection && strategy === "round-robin" && sessionId) {
       rememberSessionAffinity(providerId, sessionId, connection.id);
+    }
+    if (connection && allowanceStrategy && sessionId) {
+      // Bind the account to this turn only. The next turn's request carries a
+      // different signature, does not match, and is re-planned.
+      rememberSessionAffinity(providerId, sessionId, connection.id, conversationTurn);
     }
 
     throwIfAborted(signal);

@@ -183,6 +183,11 @@ export const PROVIDER_QUOTA_CONFIG = deepFreeze({
     sourceId: "codebuddy-cn:billing-meter:v1",
     url: "https://copilot.tencent.com/v2/billing/meter/get-user-resource",
     runtimeScopes: { cooldown: "model", exhausted: "account" },
+    // CodeBuddy CN's pools move on a daily/weekly/monthly cycle and the vendor
+    // has no cheap read. A 60s freshness window would throw away a perfectly
+    // usable reading between two whole-pool refreshes, which is what left the
+    // pool unreadable while `least-used` tried to rank it.
+    freshnessMs: 5 * 60 * 1000,
     preflightPolicy: PREFLIGHT_POLICY.codebuddy
   },
   "bailian-coding-plan": {
